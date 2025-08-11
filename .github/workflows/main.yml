@@ -1,0 +1,46 @@
+name: Build T-Rex APK (ZIP)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Tools installieren
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip curl
+
+      - name: Android SDK einrichten
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 34
+          target: default
+
+      - name: Gradle 8.7 installieren (ohne Wrapper)
+        run: |
+          curl -s "https://get.sdkman.io" | bash
+          source "$HOME/.sdkman/bin/sdkman-init.sh"
+          sdk install gradle 8.7
+          echo "$HOME/.sdkman/candidates/gradle/8.7/bin" >> $GITHUB_PATH
+
+      - name: Projekt aus ZIP entpacken
+        run: |
+          unzip -o TrexRoarApp_v2.zip -d .
+          if [ -d "TrexRoarApp_v2" ]; then echo "PROJECT_DIR=TrexRoarApp_v2" >> $GITHUB_ENV; else echo "PROJECT_DIR=." >> $GITHUB_ENV; fi
+
+      - name: Debug-APK bauen
+        run: |
+          cd "$PROJECT_DIR"
+          gradle :app:assembleDebug --no-daemon
+
+      - name: APK hochladen (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: trex-debug-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
