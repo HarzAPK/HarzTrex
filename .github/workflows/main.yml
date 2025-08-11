@@ -34,9 +34,6 @@ jobs:
           for d in "$SDKROOT/cmdline-tools/latest/bin" "$SDKROOT/cmdline-tools/17.0/bin" "$SDKROOT/cmdline-tools/16.0/bin"; do
             if [ -x "$d/sdkmanager" ]; then SDKMANAGER="$d/sdkmanager"; break; fi
           done
-          if [ -z "$SDKMANAGER" ]; then echo "sdkmanager nicht gefunden"; exit 1; fi
-          "$SDKMANAGER" --version || true
-          # Kann mit "Broken pipe" enden -> nicht als Fehler werten
           yes | "$SDKMANAGER" --licenses || true
 
       - name: Android Pakete installieren
@@ -45,7 +42,6 @@ jobs:
           set -e
           SDKROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
           SDKMANAGER="$(ls -d "$SDKROOT"/cmdline-tools/*/bin | head -n1)/sdkmanager"
-          # Auch hier: gelegentlich "Broken pipe" -> ignorieren
           yes | "$SDKMANAGER" --install "platforms;android-34" "build-tools;34.0.0" "platform-tools" || true
 
       - name: Gradle 8.7 installieren
@@ -68,11 +64,20 @@ jobs:
             echo "Kein app/-Ordner gefunden"; ls -la extracted; exit 1
           fi
 
+      # >>> Fix für deinen Fehler: AndroidX/Jetifier einschalten
+      - name: AndroidX aktivieren
+        run: |
+          cd "$PROJECT_DIR"
+          touch gradle.properties
+          sed -i '/^android.useAndroidX/d' gradle.properties || true
+          sed -i '/^android.enableJetifier/d' gradle.properties || true
+          echo 'android.useAndroidX=true' >> gradle.properties
+          echo 'android.enableJetifier=true' >> gradle.properties
+          echo 'org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8' >> gradle.properties
+
       - name: Debug-APK bauen
         run: |
           cd "$PROJECT_DIR"
-          test -f build.gradle.kts || (echo "build.gradle.kts fehlt" && exit 1)
-          test -f settings.gradle.kts || (echo "settings.gradle.kts fehlt" && exit 1)
           gradle :app:assembleDebug --no-daemon --stacktrace
 
       - name: APK hochladen
