@@ -22,11 +22,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y unzip curl
 
-      # Nur SDK bereitstellen (KEINE packages/accept-Flags hier!)
       - name: Android SDK Basis einrichten
         uses: android-actions/setup-android@v3
 
-      # Pfad zum sdkmanager finden + Lizenzen akzeptieren
       - name: SDK-Manager vorbereiten & Lizenzen akzeptieren
         shell: bash
         run: |
@@ -36,13 +34,12 @@ jobs:
           for d in "$SDKROOT/cmdline-tools/latest/bin" "$SDKROOT/cmdline-tools/17.0/bin" "$SDKROOT/cmdline-tools/16.0/bin"; do
             if [ -x "$d/sdkmanager" ]; then SDKMANAGER="$d/sdkmanager"; break; fi
           done
-          if [ -z "$SDKMANAGER" ]; then
-            echo "sdkmanager nicht gefunden"; exit 1
-          fi
-          "$SDKMANAGER" --version
-          yes | "$SDKMANAGER" --licenses
+          if [ -z "$SDKMANAGER" ]; then echo "sdkmanager nicht gefunden"; exit 1; fi
+          "$SDKMANAGER" --version || true
+          # Bekannter Bug: 'yes | sdkmanager --licenses' kann mit 'Broken pipe' enden.
+          # Mit '|| true' ignorieren wir das, nachdem alle Lizenzen akzeptiert wurden.
+          yes | "$SDKMANAGER" --licenses || true
 
-      # Benötigte Pakete explizit installieren
       - name: Android Pakete installieren
         shell: bash
         run: |
