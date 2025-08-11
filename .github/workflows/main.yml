@@ -16,7 +16,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y unzip curl
 
-      # Android SDK korrekt einrichten (neues Input-Schema)
       - name: Android SDK einrichten
         uses: android-actions/setup-android@v3
         with:
@@ -27,7 +26,6 @@ jobs:
             build-tools;34.0.0
             platform-tools
 
-      # Gradle 8.7 ohne Wrapper
       - name: Gradle 8.7 installieren
         run: |
           curl -s "https://get.sdkman.io" | bash
@@ -36,24 +34,19 @@ jobs:
           echo "$HOME/.sdkman/candidates/gradle/8.7/bin" >> $GITHUB_PATH
           gradle --version
 
-      # ZIP entpacken (muss im Repo-Wurzelordner liegen)
       - name: Projekt aus ZIP entpacken
         run: |
           test -f TrexRoarApp_v2.zip || (echo "TrexRoarApp_v2.zip fehlt im Repo-Wurzelordner" && exit 1)
           unzip -o TrexRoarApp_v2.zip -d extracted
-          # Projektverzeichnis ermitteln
           if [ -d "extracted/TrexRoarApp_v2/app" ]; then
             echo "PROJECT_DIR=extracted/TrexRoarApp_v2" >> $GITHUB_ENV
           elif [ -d "extracted/app" ]; then
             echo "PROJECT_DIR=extracted" >> $GITHUB_ENV
           else
-            echo "Kein app/-Ordner gefunden. Struktur:"
-            ls -la extracted
-            exit 1
+            echo "Kein app/-Ordner gefunden"; ls -la extracted; exit 1
           fi
           echo "Benutztes Projektverzeichnis: $PROJECT_DIR"
 
-      # Debug-APK bauen
       - name: Debug-APK bauen
         run: |
           cd "$PROJECT_DIR"
@@ -61,7 +54,6 @@ jobs:
           test -f settings.gradle.kts || (echo "settings.gradle.kts fehlt" && exit 1)
           gradle :app:assembleDebug --no-daemon --stacktrace
 
-      # APK als Artefakt veröffentlichen
       - name: APK hochladen
         uses: actions/upload-artifact@v4
         with:
