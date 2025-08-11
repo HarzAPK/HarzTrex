@@ -22,26 +22,34 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y unzip curl
 
-      - name: Android SDK einrichten
+      # Nur SDK bereitstellen (KEINE packages/accept-Flags hier!)
+      - name: Android SDK Basis einrichten
         uses: android-actions/setup-android@v3
-        with:
-          accept-android-sdk-licenses: true
-          log-accepted-android-sdk-licenses: true
-          packages: |
-            platforms;android-34
-            build-tools;34.0.0
-            platform-tools
 
-      # WICHTIG: auch spezielle Google-Lizenzen (z.B. Google TV) akzeptieren
-      - name: Alle SDK-Lizenzen akzeptieren (inkl. Google TV)
+      # Pfad zum sdkmanager finden + Lizenzen akzeptieren
+      - name: SDK-Manager vorbereiten & Lizenzen akzeptieren
         shell: bash
         run: |
           set -e
-          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          if [ ! -x "$SDKMANAGER" ]; then
-            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          SDKROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          SDKMANAGER=""
+          for d in "$SDKROOT/cmdline-tools/latest/bin" "$SDKROOT/cmdline-tools/17.0/bin" "$SDKROOT/cmdline-tools/16.0/bin"; do
+            if [ -x "$d/sdkmanager" ]; then SDKMANAGER="$d/sdkmanager"; break; fi
+          done
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager nicht gefunden"; exit 1
           fi
+          "$SDKMANAGER" --version
           yes | "$SDKMANAGER" --licenses
+
+      # Benötigte Pakete explizit installieren
+      - name: Android Pakete installieren
+        shell: bash
+        run: |
+          set -e
+          SDKROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          SDKMANAGER="$(ls -d "$SDKROOT"/cmdline-tools/*/bin | head -n1)/sdkmanager"
+          yes | "$SDKMANAGER" "platforms;android-34" "build-tools;34.0.0" "platform-tools"
 
       - name: Gradle 8.7 installieren
         run: |
@@ -62,7 +70,6 @@ jobs:
           else
             echo "Kein app/-Ordner gefunden"; ls -la extracted; exit 1
           fi
-          echo "Benutztes Projektverzeichnis: $PROJECT_DIR"
 
       - name: Debug-APK bauen
         run: |
