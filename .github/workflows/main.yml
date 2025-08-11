@@ -35,13 +35,6 @@ jobs:
             if [ -x "$d/sdkmanager" ]; then SDKMANAGER="$d/sdkmanager"; break; fi
           done
           yes | "$SDKMANAGER" --licenses || true
-
-      - name: Android Pakete installieren
-        shell: bash
-        run: |
-          set -e
-          SDKROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-          SDKMANAGER="$(ls -d "$SDKROOT"/cmdline-tools/*/bin | head -n1)/sdkmanager"
           yes | "$SDKMANAGER" --install "platforms;android-34" "build-tools;34.0.0" "platform-tools" || true
 
       - name: Gradle 8.7 installieren
@@ -64,16 +57,56 @@ jobs:
             echo "Kein app/-Ordner gefunden"; ls -la extracted; exit 1
           fi
 
-      # >>> Fix für deinen Fehler: AndroidX/Jetifier einschalten
       - name: AndroidX aktivieren
         run: |
           cd "$PROJECT_DIR"
           touch gradle.properties
           sed -i '/^android.useAndroidX/d' gradle.properties || true
           sed -i '/^android.enableJetifier/d' gradle.properties || true
-          echo 'android.useAndroidX=true' >> gradle.properties
-          echo 'android.enableJetifier=true' >> gradle.properties
-          echo 'org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8' >> gradle.properties
+          printf 'android.useAndroidX=true\nandroid.enableJetifier=true\norg.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8\n' >> gradle.properties
+
+      # ---> Fix: namespace + SDK-Level sicher setzen
+      - name: Gradle-Konfiguration patchen (namespace/SDK)
+        shell: bash
+        run: |
+          set -e
+          APP_DIR="$PROJECT_DIR/app"
+          MANIFEST="$APP_DIR/src/main/AndroidManifest.xml"
+          GRADLE="$APP_DIR/build.gradle.kts"
+          test -f "$GRADLE" || (echo "build.gradle.kts fehlt in app/" && exit 1)
+          PKG=$(grep -oP 'package="\K[^"]+' "$MANIFEST" || true)
+          # Falls kein package im Manifest, fallback:
+          [ -z "$PKG" ] && PKG="com.example.app"
+          # namespace eintragen/ersetzen
+          if grep -q 'namespace\s*=' "$GRADLE"; then
+            sed -i "s/namespace\s*=\s*\"[^\"]*\"/namespace = \"$PKG\"/" "$GRADLE"
+          else
+            # nach der Zeile 'android {' eine namespace-Zeile einfügen
+            awk -v ns="$PKG" '
+              {print}
+              /android\s*\{/ && !done {print "    namespace = \"" ns "\""; done=1}
+            ' "$GRADLE" > "$GRADLE.new" && mv "$GRADLE.new" "$GRADLE"
+          fi
+          # compileSdk/targetSdk auf 34 bringen (falls niedriger/fehlt)
+          if grep -q 'compileSdk\s*=' "$GRADLE"; then
+            sed -i 's/compileSdk\s*=\s*[0-9]\+/compileSdk = 34/' "$GRADLE"
+          else
+            awk '
+              {print}
+              /android\s*\{/ && !done {print "    compileSdk = 34"; done=1}
+            ' "$GRADLE" > "$GRADLE.new" && mv "$GRADLE.new" "$GRADLE"
+          fi
+          if grep -q 'targetSdk\s*=' "$GRADLE"; then
+            sed -i 's/targetSdk\s*=\s*[0-9]\+/targetSdk = 34/' "$GRADLE"
+          else
+            awk '
+              BEGIN{ins=0}
+              /defaultConfig\s*\{/ {print; print "        targetSdk = 34"; ins=1; next}
+              {print}
+            ' "$GRADLE" > "$GRADLE.new" && mv "$GRADLE.new" "$GRADLE"
+          fi
+          echo "==== build.gradle.kts nach Patch ===="
+          sed -n '1,200p' "$GRADLE"
 
       - name: Debug-APK bauen
         run: |
