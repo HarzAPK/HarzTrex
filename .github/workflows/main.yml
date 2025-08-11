@@ -11,6 +11,12 @@ jobs:
       - name: Repository auschecken
         uses: actions/checkout@v4
 
+      - name: JDK 17 installieren
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
       - name: Tools installieren
         run: |
           sudo apt-get update
@@ -25,6 +31,17 @@ jobs:
             platforms;android-34
             build-tools;34.0.0
             platform-tools
+
+      # WICHTIG: auch spezielle Google-Lizenzen (z.B. Google TV) akzeptieren
+      - name: Alle SDK-Lizenzen akzeptieren (inkl. Google TV)
+        shell: bash
+        run: |
+          set -e
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          yes | "$SDKMANAGER" --licenses
 
       - name: Gradle 8.7 installieren
         run: |
