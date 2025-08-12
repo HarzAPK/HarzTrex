@@ -38,21 +38,77 @@ jobs:
           test -f TrexRoarApp_v2.zip || (echo "ZIP nicht gefunden!" && exit 1)
           rm -rf extracted
           unzip -o TrexRoarApp_v2.zip -d extracted
-          # Projektverzeichnis finden (Ordner mit settings.gradle*)
           ROOT=$(find extracted -maxdepth 2 -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" \) -printf "%h\n" | head -n1)
-          if [ -z "$ROOT" ]; then
-            echo "Kein Gradle-Projekt gefunden."; exit 1
-          fi
+          [ -z "$ROOT" ] && { echo "Kein Gradle-Projekt gefunden."; exit 1; }
           echo "PROJECT_DIR=$ROOT" >> "$GITHUB_ENV"
           echo "Benutztes Projektverzeichnis: $ROOT"
 
       - name: AndroidX + Gradle-Properties setzen
         run: |
-          set -e
           PROPS="$PROJECT_DIR/gradle.properties"
           touch "$PROPS"
           grep -q '^android.useAndroidX=' "$PROPS" || echo "android.useAndroidX=true" >> "$PROPS"
           grep -q '^android.enableJetifier=' "$PROPS" || echo "android.enableJetifier=true" >> "$PROPS"
+
+      - name: Launcher-Icon reparieren (Fallback)
+        shell: bash
+        run: |
+          set -e
+          APP="$PROJECT_DIR/app"
+          RES="$APP/src/main/res"
+          mkdir -p "$RES"
+
+          # 1) Ein passendes PNG im drawable suchen (unsere T-Rex-Grafik)
+          ICON_SRC=""
+          for n in trex_icon trex_logo trex_skull_logo app_icon; do
+            [ -f "$RES/drawable/$n.png" ] && ICON_SRC="$RES/drawable/$n.png" && ICON_NAME="$n" && break
+          done
+          if [ -z "$ICON_SRC" ]; then
+            CAND=$(find "$RES/drawable" -maxdepth 1 -type f -name "*.png" | head -n1 || true)
+            if [ -n "$CAND" ]; then ICON_SRC="$CAND"; ICON_NAME="$(basename "$CAND" .png)"; fi
+          fi
+          if [ -z "$ICON_SRC" ]; then
+            echo "Kein Icon-PNG gefunden – Schritt wird übersprungen."; exit 0
+          fi
+
+          # 2) In alle mipmap-Ordner kopieren (als klassische Launcher-Icons)
+          for d in mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
+            mkdir -p "$RES/$d"
+            cp -f "$ICON_SRC" "$RES/$d/ic_launcher.png" || true
+            cp -f "$ICON_SRC" "$RES/$d/ic_launcher_round.png" || true
+          done
+
+          # 3) Adaptive Icon-XMLs anlegen, falls fehlen
+          mkdir -p "$RES/mipmap-anydpi-v26"
+          if [ ! -f "$RES/mipmap-anydpi-v26/ic_launcher.xml" ]; then
+            cat > "$RES/mipmap-anydpi-v26/ic_launcher.xml" <<EOF
+<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+  <background android:drawable="@android:color/black"/>
+  <foreground android:drawable="@drawable/${ICON_NAME}"/>
+</adaptive-icon>
+EOF
+          fi
+          if [ ! -f "$RES/mipmap-anydpi-v26/ic_launcher_round.xml" ]; then
+            cat > "$RES/mipmap-anydpi-v26/ic_launcher_round.xml" <<EOF
+<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+  <background android:drawable="@android:color/black"/>
+  <foreground android:drawable="@drawable/${ICON_NAME}"/>
+</adaptive-icon>
+EOF
+          fi
+
+          # 4) Manifest sicher auf mipmap-Icons setzen
+          MAN="$APP/src/main/AndroidManifest.xml"
+          if [ -f "$MAN" ]; then
+            sed -i -E 's/android:icon="[^"]*"/android:icon="@mipmap\/ic_launcher"/' "$MAN" || true
+            if grep -q 'android:roundIcon=' "$MAN"; then
+              sed -i -E 's/android:roundIcon="[^"]*"/android:roundIcon="@mipmap\/ic_launcher_round"/' "$MAN" || true
+            else
+              sed -i -E 's/(<application[^>]*>)/\1\n        android:roundIcon="@mipmap\/ic_launcher_round"/' "$MAN" || true
+            fi
+          fi
 
       - name: Namespace/SDK prüfen und nur bei Bedarf patchen
         shell: bash
@@ -61,48 +117,32 @@ jobs:
           APP="$PROJECT_DIR/app"
           MANIFEST="$APP/src/main/AndroidManifest.xml"
           PKG=""
-          if [ -f "$MANIFEST" ]; then
-            PKG=$(grep -oP 'package="\K[^"]+' "$MANIFEST" || true)
-          fi
+          [ -f "$MANIFEST" ] && PKG=$(grep -oP 'package="\K[^"]+' "$MANIFEST" || true)
           [ -z "$PKG" ] && PKG="com.example.app"
-
           FILE=""
           KTS=0
-          if [ -f "$APP/build.gradle.kts" ]; then
-            FILE="$APP/build.gradle.kts"; KTS=1
-          elif [ -f "$APP/build.gradle" ]; then
-            FILE="$APP/build.gradle"
-          else
-            echo "Keine build.gradle(.kts) gefunden – Schritt wird übersprungen."
-            exit 0
-          fi
-          echo "Gefundene Gradle-Datei: $FILE"
+          if [ -f "$APP/build.gradle.kts" ]; then FILE="$APP/build.gradle.kts"; KTS=1
+          elif [ -f "$APP/build.gradle" ]; then FILE="$APP/build.gradle"; else echo "Keine build.gradle gefunden – ok."; exit 0; fi
 
-          if grep -q 'namespace' "$FILE" \
-             && grep -q 'compileSdk' "$FILE" \
-             && grep -q 'targetSdk' "$FILE"; then
-            echo "Namespace/SDK bereits gesetzt – nichts zu tun."
-            exit 0
+          if grep -q 'namespace' "$FILE" && grep -q 'compileSdk' "$FILE" && grep -q 'targetSdk' "$FILE"; then
+            echo "Namespace/SDK bereits gesetzt."; exit 0
           fi
 
           if [ $KTS -eq 1 ]; then
-            sed -i.bak -E \
-              -e "s/namespace *= *\"[^\"]+\"/namespace = \"$PKG\"/g" \
-              -e "s/compileSdk *= *[0-9]+/compileSdk = 34/g" \
-              -e "s/targetSdk *= *[0-9]+/targetSdk = 34/g" "$FILE" || true
+            sed -i.bak -E -e "s/namespace *= *\"[^\"]+\"/namespace = \"$PKG\"/g" \
+                           -e "s/compileSdk *= *[0-9]+/compileSdk = 34/g" \
+                           -e "s/targetSdk *= *[0-9]+/targetSdk = 34/g" "$FILE" || true
             grep -q 'namespace' "$FILE" || awk -v ns="$PKG" '{print} /android[[:space:]]*\{/ && !done {print "    namespace = \"" ns "\""; done=1}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
             grep -q 'compileSdk' "$FILE" || awk '{print} /android[[:space:]]*\{/ && !done {print "    compileSdk = 34"; done=1}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
             grep -q 'targetSdk' "$FILE" || awk 'BEGIN{ins=0} /defaultConfig[[:space:]]*\{/ {print; print "        targetSdk = 34"; ins=1; next} {print}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
           else
-            sed -i.bak -E \
-              -e "s/namespace +\"[^\"]+\"/namespace \"$PKG\"/g" \
-              -e "s/compileSdk +[0-9]+/compileSdk 34/g" \
-              -e "s/targetSdk +[0-9]+/targetSdk 34/g" "$FILE" || true
+            sed -i.bak -E -e "s/namespace +\"[^\"]+\"/namespace \"$PKG\"/g" \
+                           -e "s/compileSdk +[0-9]+/compileSdk 34/g" \
+                           -e "s/targetSdk +[0-9]+/targetSdk 34/g" "$FILE" || true
             grep -q 'namespace' "$FILE" || awk -v ns="$PKG" '{print} /android[[:space:]]*\{/ && !done {print "    namespace \"" ns "\""; done=1}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
             grep -q 'compileSdk' "$FILE" || awk '{print} /android[[:space:]]*\{/ && !done {print "    compileSdk 34"; done=1}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
             grep -q 'targetSdk' "$FILE" || awk 'BEGIN{ins=0} /defaultConfig[[:space:]]*\{/ {print; print "        targetSdk 34"; ins=1; next} {print}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
           fi
-
           echo "Patch-Schritt abgeschlossen."
 
       - name: Debug-APK bauen
