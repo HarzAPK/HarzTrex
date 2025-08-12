@@ -1,18 +1,71 @@
-- name: Namespace/SDK prüfen und nur bei Bedarf patchen
+name: T-Rex APK erstellen (ZIP)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Tools installieren
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip curl
+
+      - name: Android SDK Basis einrichten
+        uses: android-actions/setup-android@v3
+
+      - name: SDK-Manager vorbereiten & Lizenzen akzeptieren
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+
+      - name: Gradle 8.7 installieren
+        run: |
+          curl -s "https://get.sdkman.io" | bash
+          source "$HOME/.sdkman/bin/sdkman-init.sh"
+          sdk install gradle 8.7
+          gradle --version
+
+      - name: Projekt aus ZIP entpacken
+        run: |
+          set -e
+          test -f TrexRoarApp_v2.zip || (echo "ZIP nicht gefunden!" && exit 1)
+          rm -rf extracted
+          unzip -o TrexRoarApp_v2.zip -d extracted
+          # Projektverzeichnis finden (Ordner mit settings.gradle*)
+          ROOT=$(find extracted -maxdepth 2 -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" \) -printf "%h\n" | head -n1)
+          if [ -z "$ROOT" ]; then
+            echo "Kein Gradle-Projekt gefunden."; exit 1
+          fi
+          echo "PROJECT_DIR=$ROOT" >> "$GITHUB_ENV"
+          echo "Benutztes Projektverzeichnis: $ROOT"
+
+      - name: AndroidX + Gradle-Properties setzen
+        run: |
+          set -e
+          PROPS="$PROJECT_DIR/gradle.properties"
+          touch "$PROPS"
+          grep -q '^android.useAndroidX=' "$PROPS" || echo "android.useAndroidX=true" >> "$PROPS"
+          grep -q '^android.enableJetifier=' "$PROPS" || echo "android.enableJetifier=true" >> "$PROPS"
+
+      - name: Namespace/SDK prüfen und nur bei Bedarf patchen
         shell: bash
         run: |
           set -e
           APP="$PROJECT_DIR/app"
           MANIFEST="$APP/src/main/AndroidManifest.xml"
-
-          # Package aus Manifest lesen (Fallback)
           PKG=""
           if [ -f "$MANIFEST" ]; then
             PKG=$(grep -oP 'package="\K[^"]+' "$MANIFEST" || true)
           fi
           [ -z "$PKG" ] && PKG="com.example.app"
 
-          # Gradle-Datei finden (KTS oder Groovy)
           FILE=""
           KTS=0
           if [ -f "$APP/build.gradle.kts" ]; then
@@ -25,7 +78,6 @@
           fi
           echo "Gefundene Gradle-Datei: $FILE"
 
-          # Prüfen, ob bereits korrekt
           if grep -q 'namespace' "$FILE" \
              && grep -q 'compileSdk' "$FILE" \
              && grep -q 'targetSdk' "$FILE"; then
@@ -33,19 +85,15 @@
             exit 0
           fi
 
-          # Nur bei Bedarf patchen (robust, ohne .new-Datei)
           if [ $KTS -eq 1 ]; then
-            # Kotlin DSL
             sed -i.bak -E \
               -e "s/namespace *= *\"[^\"]+\"/namespace = \"$PKG\"/g" \
               -e "s/compileSdk *= *[0-9]+/compileSdk = 34/g" \
               -e "s/targetSdk *= *[0-9]+/targetSdk = 34/g" "$FILE" || true
-            # Falls Einträge fehlen, minimal einfügen
             grep -q 'namespace' "$FILE" || awk -v ns="$PKG" '{print} /android[[:space:]]*\{/ && !done {print "    namespace = \"" ns "\""; done=1}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
             grep -q 'compileSdk' "$FILE" || awk '{print} /android[[:space:]]*\{/ && !done {print "    compileSdk = 34"; done=1}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
             grep -q 'targetSdk' "$FILE" || awk 'BEGIN{ins=0} /defaultConfig[[:space:]]*\{/ {print; print "        targetSdk = 34"; ins=1; next} {print}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
           else
-            # Groovy DSL
             sed -i.bak -E \
               -e "s/namespace +\"[^\"]+\"/namespace \"$PKG\"/g" \
               -e "s/compileSdk +[0-9]+/compileSdk 34/g" \
@@ -56,3 +104,15 @@
           fi
 
           echo "Patch-Schritt abgeschlossen."
+
+      - name: Debug-APK bauen
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+          gradle :app:assembleDebug --no-daemon
+
+      - name: APK hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: trex-debug-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
