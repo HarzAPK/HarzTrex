@@ -3,6 +3,9 @@ name: T-Rex APK erstellen (ZIP)
 on:
   workflow_dispatch:
 
+env:
+  ZIP_NAME: TrexRoarApp_v2.zip
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -11,14 +14,14 @@ jobs:
       - name: Repository auschecken
         uses: actions/checkout@v4
 
-      - name: Android SDK vorbereiten
-        uses: android-actions/setup-android@v3
-
       - name: JDK 17 installieren
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
+
+      - name: Android SDK vorbereiten
+        uses: android-actions/setup-android@v3
 
       - name: Tools installieren
         run: |
@@ -27,95 +30,49 @@ jobs:
 
       - name: ZIP entpacken
         run: |
-          test -f TrexRoarApp_v2.zip || (echo "TrexRoarApp_v2.zip fehlt im Repo-Root" && exit 1)
-          unzip -q TrexRoarApp_v2.zip -d extracted
-          # Projektordner finden (app/ muss drin liegen)
-          PROJ="$(ls -1 extracted | head -n1)"
-          if [ -d "extracted/$PROJ/app" ]; then
-            echo "PROJECT_DIR=extracted/$PROJ" >> $GITHUB_ENV
-          elif [ -d "extracted/app" ]; then
+          if [ ! -f "$ZIP_NAME" ]; then
+            echo "::error ::$ZIP_NAME fehlt im Repository-Root"
+            exit 1
+          fi
+          unzip -q "$ZIP_NAME" -d extracted
+          if [ -d extracted/app ]; then
             echo "PROJECT_DIR=extracted" >> $GITHUB_ENV
           else
-            echo "Kein gültiger Projektordner gefunden"; exit 1
+            FIRST=$(ls -1 extracted | head -n1)
+            echo "PROJECT_DIR=extracted/$FIRST" >> $GITHUB_ENV
           fi
-          echo "Gefundener Projektordner: $PROJECT_DIR"
 
-      - name: Namespace/SDK & Libs fixen
+      - name: Projekt fixen
         run: |
-          set -e
           cd "$PROJECT_DIR"
+          echo "android.useAndroidX=true" >> gradle.properties
+          echo "android.enableJetifier=true" >> gradle.properties
 
-          # --- build.gradle(.kts) robust patchen ---
-          FILE_GROOVY="app/build.gradle"
-          FILE_KTS="app/build.gradle.kts"
-          if [ -f "$FILE_KTS" ]; then GR="$FILE_KTS"; else GR="$FILE_GROOVY"; fi
+          GR="app/build.gradle"
+          [ -f app/build.gradle.kts ] && GR="app/build.gradle.kts"
 
-          # compile/target/min SDK setzen (sowohl kts als auch groovy Varianten)
-          if grep -q "android\s*{" "$GR"; then
-            sed -i 's/compilesdk.*/compileSdk = 34/gI' "$GR" || true
-            sed -i 's/compileSdkVersion.*/compileSdkVersion 34/gI' "$GR" || true
-            sed -i 's/targetsdk.*/targetSdk = 34/gI' "$GR" || true
-            sed -i 's/targetSdkVersion.*/targetSdkVersion 34/gI' "$GR" || true
-            sed -i 's/minsdk.*/minSdk = 24/gI' "$GR" || true
-            sed -i 's/minSdkVersion.*/minSdkVersion 24/gI' "$GR" || true
-          fi
+          sed -i 's/compileSdkVersion *[0-9][0-9]*/compileSdkVersion 34/g' "$GR" || true
+          sed -i 's/targetSdkVersion *[0-9][0-9]*/targetSdkVersion 34/g' "$GR" || true
+          sed -i 's/minSdkVersion *[0-9][0-9]*/minSdkVersion 24/g' "$GR" || true
 
-          # android { buildFeatures } leeren, falls DataBinding ohne Setup drin steht
-          if grep -qi "dataBinding" "$GR"; then
-            sed -i 's/dataBinding\s*=\s*true/dataBinding = false/gI' "$GR" || true
-          fi
-
-          # Dependencies sicherstellen (Material + Splashscreen)
           if ! grep -q "com.google.android.material" "$GR"; then
-            if echo "$GR" | grep -q ".kts$"; then
-              sed -i '/dependencies\s*{/a \    implementation("com.google.android.material:material:1.12.0")\n    implementation("androidx.core:core-splashscreen:1.0.1")' "$GR"
-            else
-              sed -i '/dependencies\s*{/a \    implementation "com.google.android.material:material:1.12.0"\n    implementation "androidx.core:core-splashscreen:1.0.1"' "$GR"
-            fi
+            echo '    implementation "com.google.android.material:material:1.12.0"' >> "$GR"
+            echo '    implementation "androidx.core:core-splashscreen:1.0.1"' >> "$GR"
           fi
 
-          # --- Themes/Styles vereinfachen und Splash-Verweise raus ---
           mkdir -p app/src/main/res/values app/src/main/res/values-night
-
-          # Alles mit "splash" in Values/Manifest hart entfernen, falls vorhanden
-          grep -RIl "splash" app/src/main || true
-          find app/src/main -type f -name "*.xml" -print0 | xargs -0 sed -i '/splashScreen/d;/Splash/d' || true
-
-          # Minimal-Themes schreiben (überschreibt, falls vorhanden)
           cat > app/src/main/res/values/themes.xml <<'XML'
 <resources xmlns:tools="http://schemas.android.com/tools">
-    <style name="AppTheme" parent="Theme.Material3.DayNight.NoActionBar" />
-    <!-- Falls das Projekt einen spezifischen Namen nutzt, leiten wir auf AppTheme um -->
-    <style name="Theme.TrexRoarApp" parent="AppTheme" tools:override="true"/>
+  <style name="AppTheme" parent="Theme.Material3.DayNight.NoActionBar"/>
+  <style name="Theme.TrexRoarApp" parent="AppTheme" tools:override="true"/>
 </resources>
 XML
-
-          cat > app/src/main/res/values-night/themes.xml <<'XML'
-<resources xmlns:tools="http://schemas.android.com/tools">
-    <style name="AppTheme" parent="Theme.Material3.DayNight.NoActionBar" />
-    <style name="Theme.TrexRoarApp" parent="AppTheme" tools:override="true"/>
-</resources>
-XML
-
-          # Fallback styles.xml (falls Projekt styles statt themes referenziert)
-          cat > app/src/main/res/values/styles.xml <<'XML'
-<resources xmlns:tools="http://schemas.android.com/tools">
-    <style name="AppTheme" parent="Theme.Material3.DayNight.NoActionBar" />
-    <style name="Theme.TrexRoarApp" parent="AppTheme" tools:override="true"/>
-</resources>
-XML
-
-          # Manifest: AppTheme erzwingen, evtl. vorhandene Theme-Angaben ersetzen
-          MANI="app/src/main/AndroidManifest.xml"
-          if [ -f "$MANI" ]; then
-            sed -i 's/android:theme="[^"]*"/android:theme="@style\/AppTheme"/g' "$MANI" || true
-          fi
+          cp app/src/main/res/values/themes.xml app/src/main/res/values-night/themes.xml
+          sed -i 's/android:theme="[^"]*"/android:theme="@style\/AppTheme"/g' app/src/main/AndroidManifest.xml || true
 
       - name: Debug-APK bauen
         run: |
           cd "$PROJECT_DIR"
-          # Ohne Daemon, damit Runner sauber endet
-          ./gradlew -v >/dev/null 2>&1 || true
           ./gradlew :app:assembleDebug --no-daemon
 
       - name: APK hochladen
