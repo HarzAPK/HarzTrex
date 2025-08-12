@@ -1,7 +1,13 @@
 name: T-Rex APK erstellen (ZIP)
 
 on:
-  workflow_dispatch:  # manueller Start
+  # 1) Manuell starten möglich
+  workflow_dispatch:
+  # 2) Automatisch starten bei Änderungen an ZIP oder Workflow-Dateien
+  push:
+    paths:
+      - 'TrexRoarApp_*.zip'
+      - '.github/workflows/**'
 
 jobs:
   build:
@@ -33,7 +39,6 @@ jobs:
         shell: bash
         run: |
           set -e
-          # 1) Gradle-Wrapper suchen
           GRADLEW_PATH="$(find . -type f -name gradlew | head -n1 || true)"
           if [ -n "$GRADLEW_PATH" ]; then
             PROJECT_DIR="$(dirname "$GRADLEW_PATH")"
@@ -43,7 +48,6 @@ jobs:
             exit 0
           fi
 
-          # 2) Fallback: Projekt anhand settings.gradle / build.gradle finden
           SETTINGS_DIR="$(find . -type f \( -name settings.gradle -o -name settings.gradle.kts \) -printf '%h\n' | head -n1 || true)"
           if [ -z "$SETTINGS_DIR" ]; then
             SETTINGS_DIR="$(find . -type f \( -name build.gradle -o -name build.gradle.kts \) -printf '%h\n' | head -n1 || true)"
@@ -52,7 +56,6 @@ jobs:
           if [ -z "$SETTINGS_DIR" ]; then
             echo "Kein gradlew und kein settings.gradle/build.gradle gefunden. ZIP-Inhalt (Top-Ebene):"
             ls -la
-            echo "Bitte prüfe die ZIP-Struktur." >&2
             exit 1
           fi
 
