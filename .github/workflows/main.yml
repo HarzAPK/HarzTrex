@@ -15,17 +15,93 @@ jobs:
       - name: Repository auschecken
         uses: actions/checkout@v4
 
-      - name: JDK 17 installieren
+      - name: Tools installieren (zip/unzip, curl, jq)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip unzip curl jq
+
+      # --- ZIP entpacken ---
+      - name: ZIP-Datei finden
+        id: findzip
+        run: |
+          shopt -s nullglob
+          files=( *.zip )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::Keine ZIP-Datei im Repo gefunden."
+            exit 1
+          fi
+          # Bevorzugt TrexRoarApp_*.zip
+          ZIP=""
+          for f in "${files[@]}"; do
+            [[ "$f" == TrexRoarApp_*.zip ]] && ZIP="$f" && break
+          done
+          [[ -z "$ZIP" ]] && ZIP="${files[0]}"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: ZIP entpacken
+        run: |
+          DEST="$RUNNER_TEMP/appsrc"
+          mkdir -p "$DEST"
+          unzip -q "${{ steps.findzip.outputs.zip }}" -d "$DEST"
+
+      # --- Projekt finden & Build-Infos ermitteln ---
+      - name: Projekt + Build-Infos erkennen
+        id: detect
+        run: |
+          set -e
+          ROOT="$RUNNER_TEMP/appsrc"
+
+          # 1) Projektordner (Wrapper bevorzugt)
+          GRADLEW="$(find "$ROOT" -type f -name gradlew | head -n1 || true)"
+          if [ -n "$GRADLEW" ]; then
+            PROJ_DIR="$(dirname "$GRADLEW")"
+            HAS_WRAPPER="true"
+          else
+            SETTINGS="$(find "$ROOT" -type f \( -name settings.gradle -o -name settings.gradle.kts \) | head -n1 || true)"
+            if [ -z "$SETTINGS" ]; then
+              echo "::error::Kein Android-Projekt (gradlew/settings.gradle) gefunden!"
+              exit 1
+            fi
+            PROJ_DIR="$(dirname "$SETTINGS")"
+            HAS_WRAPPER="false"
+          fi
+
+          echo "project_dir=$PROJ_DIR" >> "$GITHUB_OUTPUT"
+          echo "has_wrapper=$HAS_WRAPPER" >> "$GITHUB_OUTPUT"
+
+          # 2) AGP-Version (com.android.tools.build:gradle)
+          AGP="$(grep -RhoE "com.android.tools.build:gradle[:'\"]+([0-9]+\.[0-9]+(\.[0-9]+)?)" "$PROJ_DIR" 2>/dev/null | head -n1 | sed -E "s/.*gradle[:'\\\"]+//")"
+          [[ -z "$AGP" ]] && AGP="8.5.2"
+          echo "agp=$AGP" >> "$GITHUB_OUTPUT"
+
+          # 3) compileSdk / buildToolsVersion
+          CS="$(grep -RhoE "compileSdk\s*=\s*[0-9]+" "$PROJ_DIR" 2>/dev/null | head -n1 | grep -oE "[0-9]+")"
+          [[ -z "$CS" ]] && CS="$(grep -RhoE "compileSdkVersion\s+[0-9]+" "$PROJ_DIR" 2>/dev/null | head -n1 | grep -oE "[0-9]+")"
+          [[ -z "$CS" ]] && CS="34"
+
+          BT="$(grep -RhoE "buildToolsVersion\s+['\"][0-9.]+['\"]" "$PROJ_DIR" 2>/dev/null | head -n1 | grep -oE "[0-9.]+")"
+          [[ -z "$BT" ]] && BT="${CS}.0.0"
+
+          echo "compile_sdk=$CS" >> "$GITHUB_OUTPUT"
+          echo "build_tools=$BT" >> "$GITHUB_OUTPUT"
+
+          # 4) Java-Version passend zur AGP
+          MAJOR="${AGP%%.*}"
+          if [ "$MAJOR" -ge 8 ]; then
+            JAVA="17"
+          else
+            JAVA="11"
+          fi
+          echo "java=$JAVA" >> "$GITHUB_OUTPUT"
+
+      # --- Java passend zur AGP einrichten ---
+      - name: Java installieren
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: ${{ steps.detect.outputs.java }}
 
-      - name: Tools installieren (zip/unzip, curl)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y zip unzip curl
-
+      # --- Android SDK installieren (nur benötigte Pakete) ---
       - name: Android SDK vorbereiten & Lizenzen akzeptieren
         run: |
           export ANDROID_HOME="$RUNNER_TEMP/android-sdk"
@@ -36,76 +112,34 @@ jobs:
           mv cmdline-tools latest
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" --licenses >/dev/null
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" \
-               "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+               "platform-tools" \
+               "platforms;android-${{ steps.detect.outputs.compile_sdk }}" \
+               "build-tools;${{ steps.detect.outputs.build_tools }}"
           echo "$ANDROID_HOME/platform-tools" >> $GITHUB_PATH
-          echo "$ANDROID_HOME/build-tools/34.0.0" >> $GITHUB_PATH
+          echo "$ANDROID_HOME/build-tools/${{ steps.detect.outputs.build_tools }}" >> $GITHUB_PATH
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
-
-      - name: ZIP-Datei finden
-        id: findzip
-        run: |
-          shopt -s nullglob
-          files=( *.zip )
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "::error::Keine ZIP-Datei im Repo gefunden."
-            exit 1
-          fi
-          ZIP=""
-          for f in "${files[@]}"; do
-            if [[ "$f" == TrexRoarApp_*.zip ]]; then ZIP="$f"; break; fi
-          done
-          if [ -z "$ZIP" ]; then ZIP="${files[0]}"; fi
-          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
-
-      - name: ZIP entpacken
-        run: |
-          DEST="$RUNNER_TEMP/appsrc"
-          mkdir -p "$DEST"
-          unzip -q "${{ steps.findzip.outputs.zip }}" -d "$DEST"
-
-      - name: Projektordner + Gradle-Datei finden
-        id: findproj
-        run: |
-          set -e
-          ROOT="$RUNNER_TEMP/appsrc"
-
-          # Gradle Wrapper suchen (korrekte Prüfung!)
-          GRADLEW="$(find "$ROOT" -type f -name "gradlew" | head -n1 || true)"
-          if [ -n "$GRADLEW" ]; then
-            echo "has_wrapper=true" >> "$GITHUB_OUTPUT"
-            echo "project_dir=$(dirname "$GRADLEW")" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Fallback: settings.gradle(.kts) -> Projektwurzel
-          SETTINGS="$(find "$ROOT" -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" \) | head -n1 || true)"
-          if [ -n "$SETTINGS" ]; then
-            echo "has_wrapper=false" >> "$GITHUB_OUTPUT"
-            echo "project_dir=$(dirname "$SETTINGS")" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "::error::Kein Android-Projekt (gradlew/settings.gradle) gefunden!"
-          exit 1
 
       - name: SDK Pfad in local.properties setzen
         run: |
-          echo "sdk.dir=$ANDROID_HOME" > "${{ steps.findproj.outputs.project_dir }}/local.properties"
+          echo "sdk.dir=$ANDROID_HOME" > "${{ steps.detect.outputs.project_dir }}/local.properties"
 
+      # --- Falls kein Wrapper: Gradle CLI besorgen (kompatibel mit Java 11/17) ---
       - name: Falls nötig Gradle CLI installieren
-        if: steps.findproj.outputs.has_wrapper == 'false'
+        if: steps.detect.outputs.has_wrapper == 'false'
         run: |
           curl -s "https://get.sdkman.io" | bash
           source "$HOME/.sdkman/bin/sdkman-init.sh"
+          # Neuere Gradle-Version – funktioniert mit Java 11/17 und AGP 7/8
           sdk install gradle 8.7
           echo "$HOME/.sdkman/candidates/gradle/current/bin" >> $GITHUB_PATH
           gradle -v
 
+      # --- Build ---
       - name: Debug-APK bauen
-        working-directory: ${{ steps.findproj.outputs.project_dir }}
+        working-directory: ${{ steps.detect.outputs.project_dir }}
         run: |
           set -e
-          if [ "${{ steps.findproj.outputs.has_wrapper }}" = "true" ]; then
+          if [ "${{ steps.detect.outputs.has_wrapper }}" = "true" ]; then
             echo "Wrapper gefunden – benutze ./gradlew"
             chmod +x ./gradlew
             ./gradlew --version
@@ -120,5 +154,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: trex-debug-apk
-          path: ${{ steps.findproj.outputs.project_dir }}/**/build/outputs/**/*.apk
+          path: ${{ steps.detect.outputs.project_dir }}/**/build/outputs/**/*.apk
           if-no-files-found: error
