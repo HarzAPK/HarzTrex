@@ -23,89 +23,29 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Android SDK vorbereiten & Lizenzen akzeptieren
+      - name: Android SDK vorbereiten & Lizenzen
         uses: android-actions/setup-android@v3
-      - name: Notwendige Android-Pakete installieren
+
+      - name: Android Pakete
         run: |
           sdkmanager --licenses <<< "y"
           sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
-      - name: ZIP prüfen & entpacken
+      - name: ZIP entpacken
+        id: unzip
         run: |
           set -e
           ZIP="TrexRoarApp_v2.zip"
-          [ -f "$ZIP" ] || { echo "ZIP '$ZIP' nicht gefunden!"; exit 1; }
+          [ -f "$ZIP" ] || { echo "ZIP '$ZIP' fehlt"; exit 1; }
           rm -rf extracted
-          mkdir -p extracted
           unzip -q "$ZIP" -d extracted
-          echo "== Inhalt von extracted =="
-          find extracted -maxdepth 3 -type f | sed 's/^/  /'
-
-      - name: Projektverzeichnis erkennen
-        id: probe
-        run: |
-          set -e
-          # Kandidaten: Verzeichnis mit settings.gradle(.kts)
-          CANDIDATE=$(dirname $(git -C extracted ls-files -z | tr '\0' '\n' | grep -E 'settings\.gradle(\.kts)?$' | head -n1) 2>/dev/null || true)
-          if [ -z "$CANDIDATE" ]; then
-            # Fallback: Verzeichnis, das app/build.gradle(.kts) enthält
-            CANDIDATE=$(dirname $(git -C extracted ls-files -z | tr '\0' '\n' | grep -E 'app/(build\.gradle(\.kts)?)$' | head -n1) 2>/dev/null || true)
-          fi
-          if [ -z "$CANDIDATE" ]; then
-            # Letzter Fallback: wenn nur ein Top-Level-Ordner existiert
-            TOP=$(find extracted -mindepth 1 -maxdepth 1 -type d | head -n1)
-            CANDIDATE="${TOP:-extracted}"
-          else
-            CANDIDATE="extracted/$CANDIDATE"
-          fi
-          echo "PROJECT_DIR=$CANDIDATE" >> "$GITHUB_OUTPUT"
-          echo "Benutztes Projektverzeichnis: $CANDIDATE"
-
-      - name: AndroidX/Namespace automatisch korrigieren (best effort)
-        run: |
-          set -e
-          PROJ="${{ steps.probe.outputs.PROJECT_DIR }}"
-          # Gradle Properties – AndroidX einschalten, falls Datei existiert
-          GP="$PROJ/gradle.properties"
-          if [ -f "$GP" ]; then
-            grep -q '^android.useAndroidX=' "$GP" || echo 'android.useAndroidX=true' >> "$GP"
-            grep -q '^android.enableJetifier=' "$GP" || echo 'android.enableJetifier=true' >> "$GP"
-            echo "gradle.properties angepasst."
-          fi
-          # Wenn kein namespace gesetzt ist, aber package im Manifest, versuche namespace zu ergänzen
-          APP_BUILD_KTS="$PROJ/app/build.gradle.kts"
-          APP_BUILD_GROOVY="$PROJ/app/build.gradle"
-          MANIFEST="$PROJ/app/src/main/AndroidManifest.xml"
-          if [ -f "$MANIFEST" ]; then
-            PKG=$(xmllint --xpath "string(//manifest/@package)" "$MANIFEST" 2>/dev/null || true)
-            if [ -n "$PKG" ]; then
-              if [ -f "$APP_BUILD_KTS" ] && ! grep -q '^ *namespace *=' "$APP_BUILD_KTS"; then
-                sed -i "1inamespace = \"$PKG\"" "$APP_BUILD_KTS"
-                echo "namespace in build.gradle.kts ergänzt: $PKG"
-              elif [ -f "$APP_BUILD_GROOVY" ] && ! grep -q '^ *namespace *' "$APP_BUILD_GROOVY"; then
-                sed -i "1inamespace \"$PKG\"" "$APP_BUILD_GROOVY"
-                echo "namespace in build.gradle ergänzt: $PKG"
-              fi
-            fi
-          fi
-
-      - name: Gradle Wrapper prüfen / Fallback installieren
-        run: |
-          set -e
-          PROJ="${{ steps.probe.outputs.PROJECT_DIR }}"
-          if [ -x "$PROJ/gradlew" ]; then
-            echo "Wrapper gefunden."
-          else
-            echo "Kein Wrapper gefunden – installiere Gradle 8.7"
-            curl -sL https://services.gradle.org/distributions/gradle-8.7-bin.zip -o /tmp/gradle.zip
-            unzip -q /tmp/gradle.zip -d $HOME/gradle
-            echo "$HOME/gradle/gradle-8.7/bin" >> $GITHUB_PATH
-          fi
+          ROOT=$(find extracted -maxdepth 2 -type f -name "settings.gradle*" -printf "%h\n" | head -n1)
+          [ -z "$ROOT" ] && ROOT="extracted"
+          echo "PROJECT_DIR=$ROOT" >> $GITHUB_OUTPUT
 
       - name: Debug-APK bauen
         run: |
-          set -e
-          PROJ="${{ steps.probe.outputs.PROJECT_DIR }}"
+          PROJ="${{ steps.unzip.outputs.PROJECT_DIR }}"
           cd "$PROJ"
           if [ -x "./gradlew" ]; then
             chmod +x ./gradlew
@@ -114,10 +54,10 @@ jobs:
             gradle --no-daemon assembleDebug
           fi
 
-      - name: APK als Artefakt hochladen
+      - name: APK hochladen
         uses: actions/upload-artifact@v4
         with:
           name: trex-debug-apk
           path: |
-            ${{ steps.probe.outputs.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
-            ${{ steps.probe.outputs.PROJECT_DIR }}/app/build/outputs/apk/*/debug/*.apk
+            ${{ steps.unzip.outputs.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+            ${{ steps.unzip.outputs.PROJECT_DIR }}/app/build/outputs/apk/*/debug/*.apk
