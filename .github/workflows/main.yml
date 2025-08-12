@@ -1,112 +1,58 @@
-name: T-Rex APK erstellen (ZIP)
-
-on:
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Repository auschecken
-        uses: actions/checkout@v4
-
-      - name: JDK 17 installieren
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
-
-      - name: Tools installieren
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y unzip curl
-
-      - name: Android SDK Basis einrichten
-        uses: android-actions/setup-android@v3
-
-      - name: SDK-Manager & Pakete
-        shell: bash
-        run: |
-          set -e
-          SDKROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-          SDKMANAGER="$(ls -d "$SDKROOT"/cmdline-tools/*/bin | head -n1)/sdkmanager"
-          yes | "$SDKMANAGER" --licenses || true
-          yes | "$SDKMANAGER" --install "platforms;android-34" "build-tools;34.0.0" "platform-tools" || true
-
-      - name: Gradle 8.7 installieren
-        run: |
-          curl -s "https://get.sdkman.io" | bash
-          source "$HOME/.sdkman/bin/sdkman-init.sh"
-          sdk install gradle 8.7
-          echo "$HOME/.sdkman/candidates/gradle/8.7/bin" >> $GITHUB_PATH
-          gradle --version
-
-      - name: Projekt aus ZIP entpacken
-        run: |
-          # WICHTIG: Datei muss TrexRoarApp_v2.zip heißen
-          test -f TrexRoarApp_v2.zip || (echo "TrexRoarApp_v2.zip fehlt im Repo-Wurzelordner" && exit 1)
-          unzip -o TrexRoarApp_v2.zip -d extracted
-          if [ -d "extracted/TrexRoarApp_v2/app" ]; then
-            echo "PROJECT_DIR=extracted/TrexRoarApp_v2" >> $GITHUB_ENV
-          elif [ -d "extracted/app" ]; then
-            echo "PROJECT_DIR=extracted" >> $GITHUB_ENV
-          else
-            echo "Kein app/-Ordner gefunden"; ls -la extracted; exit 1
-          fi
-
-      - name: AndroidX + Gradle-Props setzen
-        run: |
-          cd "$PROJECT_DIR"
-          touch gradle.properties
-          sed -i '/^android.useAndroidX/d' gradle.properties || true
-          sed -i '/^android.enableJetifier/d' gradle.properties || true
-          printf 'android.useAndroidX=true\nandroid.enableJetifier=true\norg.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8\n' >> gradle.properties
-          echo "==== gradle.properties ===="
-          cat gradle.properties
-
-      - name: Namespace/SDK in Gradle-Datei patchen (KTS oder Groovy)
+- name: Namespace/SDK prüfen und nur bei Bedarf patchen
         shell: bash
         run: |
           set -e
           APP="$PROJECT_DIR/app"
           MANIFEST="$APP/src/main/AndroidManifest.xml"
-          PKG=$(grep -oP 'package="\K[^"]+' "$MANIFEST" || true)
+
+          # Package aus Manifest lesen (Fallback)
+          PKG=""
+          if [ -f "$MANIFEST" ]; then
+            PKG=$(grep -oP 'package="\K[^"]+' "$MANIFEST" || true)
+          fi
           [ -z "$PKG" ] && PKG="com.example.app"
-          echo "Gefundenes package aus Manifest: $PKG"
 
+          # Gradle-Datei finden (KTS oder Groovy)
+          FILE=""
+          KTS=0
           if [ -f "$APP/build.gradle.kts" ]; then
-            G="$APP/build.gradle.kts"
-            echo "Patche $G (Kotlin DSL)"
-            grep -q 'namespace\s*=' "$G" && sed -i "s/namespace\s*=\s*\"[^\"]*\"/namespace = \"$PKG\"/" "$G" || \
-              awk -v ns="$PKG" '{print} /android\s*\{/ && !done {print "    namespace = \"" ns "\""; done=1}' "$G" > "$G.new" && mv "$G.new" "$G"
-            grep -q 'compileSdk\s*=' "$G" && sed -i 's/compileSdk\s*=\s*[0-9]\+/compileSdk = 34/' "$G" || \
-              awk '{print} /android\s*\{/ && !done {print "    compileSdk = 34"; done=1}' "$G" > "$G.new" && mv "$G.new" "$G"
-            grep -q 'targetSdk\s*=' "$G" && sed -i 's/targetSdk\s*=\s*[0-9]\+/targetSdk = 34/' "$G" || \
-              awk 'BEGIN{ins=0} /defaultConfig\s*\{/ {print; print "        targetSdk = 34"; ins=1; next} {print}' "$G" > "$G.new" && mv "$G.new" "$G"
-            sed -n '1,200p' "$G"
-
+            FILE="$APP/build.gradle.kts"; KTS=1
           elif [ -f "$APP/build.gradle" ]; then
-            G="$APP/build.gradle"
-            echo "Patche $G (Groovy DSL)"
-            grep -q 'namespace\s' "$G" && sed -i "s/namespace\s\+\"[^\"]*\"/namespace \"$PKG\"/" "$G" || \
-              awk -v ns="$PKG" '{print} /android\s*\{/ && !done {print "    namespace \"" ns "\""; done=1}' "$G" > "$G.new" && mv "$G.new" "$G"
-            grep -q 'compileSdk\s' "$G" && sed -i 's/compileSdk\s\+[0-9]\+/compileSdk 34/' "$G" || \
-              awk '{print} /android\s*\{/ && !done {print "    compileSdk 34"; done=1}' "$G" > "$G.new" && mv "$G.new" "$G"
-            grep -q 'targetSdk\s' "$G" && sed -i 's/targetSdk\s\+[0-9]\+/targetSdk 34/' "$G" || \
-              awk 'BEGIN{ins=0} /defaultConfig\s*\{/ {print; print "        targetSdk 34"; ins=1; next} {print}' "$G" > "$G.new" && mv "$G.new" "$G"
-            sed -n '1,200p' "$G"
+            FILE="$APP/build.gradle"
           else
-            echo "Keine build.gradle(.kts) in app/ gefunden"; exit 1
+            echo "Keine build.gradle(.kts) gefunden – Schritt wird übersprungen."
+            exit 0
+          fi
+          echo "Gefundene Gradle-Datei: $FILE"
+
+          # Prüfen, ob bereits korrekt
+          if grep -q 'namespace' "$FILE" \
+             && grep -q 'compileSdk' "$FILE" \
+             && grep -q 'targetSdk' "$FILE"; then
+            echo "Namespace/SDK bereits gesetzt – nichts zu tun."
+            exit 0
           fi
 
-      - name: Debug-APK bauen
-        run: |
-          cd "$PROJECT_DIR"
-          gradle :app:assembleDebug --no-daemon --stacktrace --warning-mode all --info
+          # Nur bei Bedarf patchen (robust, ohne .new-Datei)
+          if [ $KTS -eq 1 ]; then
+            # Kotlin DSL
+            sed -i.bak -E \
+              -e "s/namespace *= *\"[^\"]+\"/namespace = \"$PKG\"/g" \
+              -e "s/compileSdk *= *[0-9]+/compileSdk = 34/g" \
+              -e "s/targetSdk *= *[0-9]+/targetSdk = 34/g" "$FILE" || true
+            # Falls Einträge fehlen, minimal einfügen
+            grep -q 'namespace' "$FILE" || awk -v ns="$PKG" '{print} /android[[:space:]]*\{/ && !done {print "    namespace = \"" ns "\""; done=1}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+            grep -q 'compileSdk' "$FILE" || awk '{print} /android[[:space:]]*\{/ && !done {print "    compileSdk = 34"; done=1}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+            grep -q 'targetSdk' "$FILE" || awk 'BEGIN{ins=0} /defaultConfig[[:space:]]*\{/ {print; print "        targetSdk = 34"; ins=1; next} {print}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+          else
+            # Groovy DSL
+            sed -i.bak -E \
+              -e "s/namespace +\"[^\"]+\"/namespace \"$PKG\"/g" \
+              -e "s/compileSdk +[0-9]+/compileSdk 34/g" \
+              -e "s/targetSdk +[0-9]+/targetSdk 34/g" "$FILE" || true
+            grep -q 'namespace' "$FILE" || awk -v ns="$PKG" '{print} /android[[:space:]]*\{/ && !done {print "    namespace \"" ns "\""; done=1}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+            grep -q 'compileSdk' "$FILE" || awk '{print} /android[[:space:]]*\{/ && !done {print "    compileSdk 34"; done=1}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+            grep -q 'targetSdk' "$FILE" || awk 'BEGIN{ins=0} /defaultConfig[[:space:]]*\{/ {print; print "        targetSdk 34"; ins=1; next} {print}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+          fi
 
-      - name: APK hochladen
-        uses: actions/upload-artifact@v4
-        with:
-          name: trex-debug-apk
-          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          echo "Patch-Schritt abgeschlossen."
