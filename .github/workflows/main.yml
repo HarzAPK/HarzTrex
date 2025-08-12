@@ -1,14 +1,7 @@
 name: T-Rex APK erstellen (ZIP)
 
 on:
-  workflow_dispatch:
-  push:
-    paths:
-      - 'TrexRoarApp_*.zip'
-      - '.github/workflows/**'
-
-env:
-  ZIP_NAME: TrexRoarApp_v2.zip
+  workflow_dispatch:  # sorgt für den "Run workflow"-Knopf
 
 jobs:
   build:
@@ -22,66 +15,50 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
-      - name: Android SDK vorbereiten
-        uses: android-actions/setup-android@v3
-
-      - name: Tools installieren
+      # Android SDK (cmdline-tools) + Lizenzen + benötigte Pakete
+      - name: Android SDK vorbereiten & Lizenzen akzeptieren
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y unzip
+          set -e
+          yes | sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager \
+            "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
+      # ZIP-Datei entpacken (Name anpassen, falls du sie anders genannt hast)
       - name: ZIP entpacken
+        run: unzip -o TrexRoarApp_v2.zip
+
+      # Projektordner automatisch finden (Ordner mit gradlew)
+      - name: Projektordner finden
+        id: findproj
+        shell: bash
         run: |
-          if [ ! -f "$ZIP_NAME" ]; then
-            echo "::error ::$ZIP_NAME fehlt im Repository-Root"
-            echo "Lade die ZIP ins Repo hoch oder ändere ZIP_NAME oben."
+          set -e
+          PROJECT_DIR=$(dirname "$(git ls-files -z | tr '\0' '\n' | grep -m1 '/gradlew$')" || true)
+          if [ -z "$PROJECT_DIR" ]; then
+            PROJECT_DIR=$(dirname "$(find . -maxdepth 3 -type f -name gradlew | head -n1)" || true)
+          fi
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "Kein gradlew gefunden. Bitte prüfe die ZIP-Struktur." >&2
             exit 1
           fi
-          unzip -q "$ZIP_NAME" -d extracted
-          if [ -d extracted/app ]; then
-            echo "PROJECT_DIR=extracted" >> $GITHUB_ENV
-          else
-            FIRST=$(ls -1 extracted | head -n1)
-            echo "PROJECT_DIR=extracted/$FIRST" >> $GITHUB_ENV
-          fi
-
-      - name: Projekt vorbereiten (AndroidX/SDK/Theme)
-        run: |
-          cd "$PROJECT_DIR"
-          echo "android.useAndroidX=true" >> gradle.properties
-          echo "android.enableJetifier=true" >> gradle.properties
-
-          GR="app/build.gradle"
-          [ -f app/build.gradle.kts ] && GR="app/build.gradle.kts"
-
-          sed -i 's/compileSdkVersion *[0-9][0-9]*/compileSdkVersion 34/g' "$GR" || true
-          sed -i 's/targetSdkVersion *[0-9][0-9]*/targetSdkVersion 34/g' "$GR" || true
-          sed -i 's/minSdkVersion *[0-9][0-9]*/minSdkVersion 24/g' "$GR" || true
-
-          if ! grep -q "com.google.android.material" "$GR"; then
-            printf '\n    implementation "com.google.android.material:material:1.12.0"\n' >> "$GR"
-            printf '    implementation "androidx.core:core-splashscreen:1.0.1"\n' >> "$GR"
-          fi
-
-          mkdir -p app/src/main/res/values app/src/main/res/values-night
-          cat > app/src/main/res/values/themes.xml <<'XML'
-<resources xmlns:tools="http://schemas.android.com/tools">
-  <style name="AppTheme" parent="Theme.Material3.DayNight.NoActionBar"/>
-  <style name="Theme.TrexRoarApp" parent="AppTheme" tools:override="true"/>
-</resources>
-XML
-          cp app/src/main/res/values/themes.xml app/src/main/res/values-night/themes.xml
-          sed -i 's/android:theme="[^"]*"/android:theme="@style\/AppTheme"/g' app/src/main/AndroidManifest.xml || true
+          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+          echo "Gefundener Projektordner: $PROJECT_DIR"
 
       - name: Debug-APK bauen
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          cd "$PROJECT_DIR"
-          ./gradlew :app:assembleDebug --no-daemon
+          chmod +x gradlew
+          ./gradlew --version
+          ./gradlew assembleDebug
 
-      - name: APK als Artefakt hochladen
+      - name: APK hochladen
         uses: actions/upload-artifact@v4
         with:
           name: trex-debug-apk
-          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          path: |
+            ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+            ${{ env.PROJECT_DIR }}/**/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
