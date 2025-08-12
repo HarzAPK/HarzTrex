@@ -30,13 +30,12 @@ jobs:
             "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
       - name: ZIP-Datei finden
-        id: findzip
         shell: bash
         run: |
           set -e
           ZIP="$(ls TrexRoarApp_*.zip 2>/dev/null | head -n1 || true)"
           if [ -z "$ZIP" ]; then
-            echo "Keine passende ZIP gefunden (TrexRoarApp_*.zip)!"
+            echo "Keine ZIP gefunden (TrexRoarApp_*.zip)!"
             exit 1
           fi
           echo "ZIP_NAME=$ZIP" >> $GITHUB_ENV
@@ -49,43 +48,54 @@ jobs:
           rm -rf extracted
           mkdir extracted
           unzip -o "$ZIP_NAME" -d extracted
+          echo "Inhalt nach dem Entpacken:"
+          (cd extracted && find . -maxdepth 3 -print)
 
-      - name: Projektordner + Gradle-Datei finden
-        id: findproject
+      - name: Projektordner + Gradle-Datei finden (robust)
         shell: bash
         run: |
           set -e
-          GRADLEW=$(find extracted -name gradlew | head -n1 || true)
-          SETTINGS=$(find extracted -name settings.gradle -o -name settings.gradle.kts | head -n1 || true)
+          ROOT="extracted"
+
+          # 1) Wrapper oder settings.gradle suchen (egal wie tief)
+          GRADLEW=$(find "$ROOT" -type f -name gradlew 2>/dev/null | head -n1 || true)
+          SETTINGS=$(find "$ROOT" -type f \( -name settings.gradle -o -name settings.gradle.kts \) 2>/dev/null | head -n1 || true)
+
           if [ -n "$GRADLEW" ]; then
-            echo "PROJECT_DIR=$(dirname "$GRADLEW")" >> $GITHUB_ENV
-            echo "BUILD_TOOL=wrapper" >> $GITHUB_ENV
+            PROJECT_DIR="$(dirname "$GRADLEW")"
+            BUILD_TOOL="wrapper"
           elif [ -n "$SETTINGS" ]; then
-            echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> $GITHUB_ENV
-            echo "BUILD_TOOL=gradle_cli" >> $GITHUB_ENV
+            PROJECT_DIR="$(dirname "$SETTINGS")"
+            BUILD_TOOL="gradle_cli"
           else
-            echo "Kein Gradle-Projekt erkannt!"
-            find extracted -maxdepth 3 -type f | sed 's/^/  /'
+            # Fallback: ZIP-Root nehmen – wir suchen gleich trotzdem überall nach build.gradle
+            PROJECT_DIR="$ROOT"
+            BUILD_TOOL="gradle_cli"
+            echo "Hinweis: Kein gradlew / settings.gradle gefunden – nutze ZIP-Root als Projektbasis."
+          fi
+
+          # 2) App-Gradle-Datei suchen (erst app/, sonst irgendwo)
+          APP_GRADLE=$(find "$ROOT" -type f \( -name build.gradle -o -name build.gradle.kts \) -path "*/app/*" 2>/dev/null | head -n1 || true)
+          if [ -z "$APP_GRADLE" ]; then
+            APP_GRADLE=$(find "$ROOT" -type f \( -name build.gradle -o -name build.gradle.kts \) 2>/dev/null | head -n1 || true)
+          fi
+          if [ -z "$APP_GRADLE" ]; then
+            echo "Keine build.gradle(.kts) in der ZIP gefunden!"
+            echo "Struktur (bis 5 Ebenen):"
+            (cd "$ROOT" && find . -maxdepth 5 -print)
             exit 1
           fi
 
-          # app-Gradle-Datei ermitteln
-          APP_GRADLE=$(find "$PROJECT_DIR" -maxdepth 3 \( -name build.gradle -o -name build.gradle.kts \) -path "*/app/*" | head -n1 || true)
-          if [ -z "$APP_GRADLE" ]; then
-            # Fallback: erstbeste build.gradle* im Projekt
-            APP_GRADLE=$(find "$PROJECT_DIR" -maxdepth 3 \( -name build.gradle -o -name build.gradle.kts \) | head -n1 || true)
-          fi
-          if [ -z "$APP_GRADLE" ]; then
-            echo "Keine build.gradle(.kts) gefunden!"
-            exit 1
-          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+          echo "BUILD_TOOL=$BUILD_TOOL" >> $GITHUB_ENV
           echo "APP_GRADLE=$APP_GRADLE" >> $GITHUB_ENV
-          echo "Gefundene App-Gradle: $APP_GRADLE"
+          echo "Gefundener Projektordner: $PROJECT_DIR"
+          echo "Gefundene App-Gradle:     $APP_GRADLE"
 
-          # Manifest für namespace
-          MANIFEST=$(find "$PROJECT_DIR" -maxdepth 5 -path "*/src/main/AndroidManifest.xml" | head -n1 || true)
+          # Manifest-Package für namespace extrahieren (optional)
+          MANIFEST=$(find "$ROOT" -type f -path "*/src/main/AndroidManifest.xml" 2>/dev/null | head -n1 || true)
           if [ -n "$MANIFEST" ]; then
-            PKG=$(grep -oP 'package="[^"]+' "$MANIFEST" | sed 's/package="//' | head -n1)
+            PKG=$(grep -oP 'package="[^"]+' "$MANIFEST" | sed 's/package="//' | head -n1 || true)
             if [ -n "$PKG" ]; then
               echo "PKG_NAMESPACE=$PKG" >> $GITHUB_ENV
               echo "Manifest-Package: $PKG"
@@ -99,69 +109,47 @@ jobs:
           FILE="$APP_GRADLE"
           echo "Patche $FILE"
 
-          # AndroidX Flags via gradle.properties anlegen/setzen
           GP="$PROJECT_DIR/gradle.properties"
+          mkdir -p "$PROJECT_DIR"
           touch "$GP"
           grep -q '^android.useAndroidX=' "$GP" || echo 'android.useAndroidX=true' >> "$GP"
           grep -q '^android.enableJetifier=' "$GP" || echo 'android.enableJetifier=true' >> "$GP"
 
-          # compileSdk/targetSdk setzen (für Groovy und KTS Varianten)
+          # compileSdk/targetSdk -> 34 (Groovy/KTS)
           if grep -q 'compileSdk' "$FILE"; then
             sed -i 's/compileSdk[Version]* *[=]* *[0-9][0-9]*/compileSdk = 34/g' "$FILE" || true
             sed -i 's/compileSdkVersion *[0-9][0-9]*/compileSdkVersion 34/g' "$FILE" || true
           else
-            # in android{} Block einfügen
-            awk '
-              BEGIN{ins=0}
-              /android *\{/ {print; print "    compileSdk = 34"; ins=1; next}
-              {print}
-              END{if(ins==0){print "android {"; print "    compileSdk = 34"; print "}" }}
-            ' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+            awk 'BEGIN{ins=0} /android *\{/ {print; print "    compileSdk = 34"; ins=1; next} {print} END{if(ins==0){print "android {"; print "    compileSdk = 34"; print "}"}}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
           fi
 
           if grep -q 'targetSdk' "$FILE"; then
             sed -i 's/targetSdk *[=]* *[0-9][0-9]*/targetSdk = 34/g' "$FILE" || true
             sed -i 's/targetSdkVersion *[0-9][0-9]*/targetSdkVersion 34/g' "$FILE" || true
           else
-            # in defaultConfig{} Block einfügen
-            awk '
-              BEGIN{ins=0}
-              /defaultConfig *\{/ {print; print "        targetSdk = 34"; ins=1; next}
-              {print}
-              END{if(ins==0){print "defaultConfig {"; print "    targetSdk = 34"; print "}" }}
-            ' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+            awk 'BEGIN{ins=0} /defaultConfig *\{/ {print; print "        targetSdk = 34"; ins=1; next} {print} END{if(ins==0){print "defaultConfig {"; print "    targetSdk = 34"; print "}"}}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
           fi
 
-          # namespace setzen, falls fehlt
-          if [ -n "$PKG_NAMESPACE" ]; then
-            if ! grep -q '^[ \t]*namespace[ \t]*' "$FILE"; then
-              awk -v NS="$PKG_NAMESPACE" '
-                /android *\{/ && ins==0 {print; print "    namespace = \"" NS "\""; ins=1; next}
-                {print}
-              ' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
-            fi
+          # namespace aus Manifest nachtragen
+          if [ -n "$PKG_NAMESPACE" ] && ! grep -q '^[ \t]*namespace[ \t]*' "$FILE"; then
+            awk -v NS="$PKG_NAMESPACE" ' /android *\{/ && ins==0 {print; print "    namespace = \"" NS "\""; ins=1; next} {print}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
           fi
 
-          # Dependencies sicherstellen (Material, Core KTX, AppCompat, SplashScreen)
-          ensure_dep() {
-            local notoken="$1"
-            local addline="$2"
-            if ! grep -q "$notoken" "$FILE"; then
+          # Dependencies sicherstellen
+          add_dep() {
+            local token="$1"; local line="$2"
+            if ! grep -q "$token" "$FILE"; then
               if grep -q 'dependencies *\{' "$FILE"; then
-                awk -v L="$addline" '
-                  /dependencies *\{/ {print; print "    " L; next}
-                  {print}
-                ' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+                awk -v L="$line" '/dependencies *\{/ {print; print "    " L; next} {print}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
               else
-                printf "\n\ndependencies {\n    %s\n}\n" "$addline" >> "$FILE"
+                printf "\n\ndependencies {\n    %s\n}\n" "$line" >> "$FILE"
               fi
             fi
           }
-
-          ensure_dep 'androidx.core:core-ktx' 'implementation "androidx.core:core-ktx:1.13.1"'
-          ensure_dep 'androidx.appcompat:appcompat' 'implementation "androidx.appcompat:appcompat:1.7.0"'
-          ensure_dep 'com.google.android.material:material' 'implementation "com.google.android.material:material:1.12.0"'
-          ensure_dep 'androidx.core:core-splashscreen' 'implementation "androidx.core:core-splashscreen:1.0.1"'
+          add_dep 'androidx.core:core-ktx'             'implementation "androidx.core:core-ktx:1.13.1"'
+          add_dep 'androidx.appcompat:appcompat'       'implementation "androidx.appcompat:appcompat:1.7.0"'
+          add_dep 'com.google.android.material:material' 'implementation "com.google.android.material:material:1.12.0"'
+          add_dep 'androidx.core:core-splashscreen'    'implementation "androidx.core:core-splashscreen:1.0.1"'
 
           echo "Patch abgeschlossen."
 
