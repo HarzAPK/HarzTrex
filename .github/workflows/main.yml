@@ -2,11 +2,16 @@ name: T-Rex APK erstellen (ZIP)
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - "TrexRoarApp_*.zip"
+      - ".github/workflows/**"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    env:
+      ANDROID_HOME: ${{ runner.temp }}/android-sdk
 
     steps:
       - name: Repository auschecken
@@ -16,93 +21,95 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
+      # Android CLI installieren + Lizenzen akzeptieren
       - name: Android SDK vorbereiten & Lizenzen akzeptieren
         shell: bash
         run: |
-          set -euxo pipefail
-          sudo "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses <<< "y" > /dev/null
-          sudo "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-            "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          set -eux
+          mkdir -p "${ANDROID_HOME}/cmdline-tools"
+          cd "${ANDROID_HOME}/cmdline-tools"
+          curl -L -o sdk.zip "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+          unzip -q sdk.zip
+          mv cmdline-tools latest
+          yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --sdk_root="${ANDROID_HOME}" --licenses >/dev/null
+          yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --sdk_root="${ANDROID_HOME}" \
+               "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          echo "${ANDROID_HOME}/platform-tools" >> "$GITHUB_PATH"
+          echo "${ANDROID_HOME}/build-tools/34.0.0" >> "$GITHUB_PATH"
 
-      - name: ZIP-Datei im Repo-Root finden
+      # ZIP finden + entpacken
+      - name: ZIP-Datei finden
         id: findzip
         shell: bash
         run: |
-          set -euo pipefail
-          ZIP=$(ls -1 *.zip 2>/dev/null | head -n1 || true)
-          if [[ -z "$ZIP" ]]; then
-            echo "Keine *.zip im Repo-Root gefunden." >&2
-            exit 1
-          fi
-          echo "Gefundene ZIP: $ZIP"
+          set -eux
+          ZIP=$(ls -1 TrexRoarApp_*.zip | head -n1)
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
 
       - name: ZIP entpacken
         shell: bash
         run: |
           set -eux
-          rm -rf extracted
-          mkdir -p extracted
-          unzip -q "${{ steps.findzip.outputs.zip }}" -d extracted
-          echo "Struktur (max. 3 Ebenen):"
-          find extracted -maxdepth 3 -type f | sed 's/^/ - /'
+          mkdir -p "$RUNNER_TEMP/appsrc"
+          unzip -q "${{ steps.findzip.outputs.zip }}" -d "$RUNNER_TEMP/appsrc"
 
+      # Projektordner + Build-Tool erkennen
       - name: Projektordner + Gradle-Datei finden
         id: findproj
         shell: bash
         run: |
-          set -euo pipefail
-          ROOT="extracted"
-          # Suche nach settings.gradle(.kts), gradlew oder build.gradle(.kts)
-          FOUND=$(find "$ROOT" -type f \
-            \( -name "settings.gradle" -o -name "settings.gradle.kts" -o \
-               -name "gradlew" -o -name "build.gradle" -o -name "build.gradle.kts" \) \
-            | head -n1 || true)
-          if [[ -z "$FOUND" ]]; then
-            echo "Keine Gradle-Dateien in der ZIP gefunden." >&2
-            exit 1
-          fi
-          PROJ_DIR=$(dirname "$FOUND")
+          set -eux
+          ROOT="$RUNNER_TEMP/appsrc"
 
-          # Falls nur Wrapper-Datei tief im Tree liegt, bis Projektwurzel hochsteigen
-          WRAP=$(find "$PROJ_DIR" -maxdepth 3 -type f -name "gradle-wrapper.properties" | head -n1 || true)
-          if [[ -n "$WRAP" ]]; then
-            PROJ_DIR=$(dirname "$(dirname "$(dirname "$WRAP")")")
-          fi
-
-          echo "Projektordner: $PROJ_DIR"
-          echo "project_dir=$PROJ_DIR" >> "$GITHUB_OUTPUT"
-
-      - name: Prüfen ob Gradle-Wrapper existiert
-        id: wrapper
-        working-directory: ${{ steps.findproj.outputs.project_dir }}
-        shell: bash
-        run: |
-          if [[ -f gradlew ]]; then
+          # 1) Wrapper?
+          if GRADLEW=$(find "$ROOT" -type f -name "gradlew" | head -n1); then
             echo "has_wrapper=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_wrapper=false" >> "$GITHUB_OUTPUT"
+            echo "project_dir=$(dirname "$GRADLEW")" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-      - name: Falls nötig Gradle CLI installieren
-        if: steps.wrapper.outputs.has_wrapper == 'false'
+          # 2) settings.gradle(.kts)?
+          if SETTINGS=$(find "$ROOT" -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" \) | head -n1); then
+            echo "has_wrapper=false" >> "$GITHUB_OUTPUT"
+            echo "project_dir=$(dirname "$SETTINGS")" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::error::Keine build.gradle(.kts) / settings.gradle(.kts) gefunden!"
+          exit 1
+
+      # Sicherstellen, dass das Projekt das SDK findet
+      - name: Gradle-Konfig automatisch fixen (SDK/Android)
         shell: bash
         run: |
           set -eux
+          PROJECT_DIR="${{ steps.findproj.outputs.project_dir }}"
+          echo "sdk.dir=${ANDROID_HOME}" > "${PROJECT_DIR}/local.properties"
+
+      # Nur falls kein Wrapper vorhanden: Gradle CLI installieren (mit zip/unzip Fix)
+      - name: Falls nötig Gradle CLI installieren
+        if: steps.findproj.outputs.has_wrapper == 'false'
+        shell: bash
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y zip unzip
           curl -s "https://get.sdkman.io" | bash
           source "$HOME/.sdkman/bin/sdkman-init.sh"
           sdk install gradle 8.7
-          echo "$HOME/.sdkman/candidates/gradle/current/bin" >> $GITHUB_PATH
+          echo "$HOME/.sdkman/candidates/gradle/current/bin" >> "$GITHUB_PATH"
+          gradle -v
 
+      # Build
       - name: Debug-APK bauen
         working-directory: ${{ steps.findproj.outputs.project_dir }}
         shell: bash
         run: |
           set -eux
-          if [[ -f gradlew ]]; then
-            chmod +x gradlew
+          if [ "${{ steps.findproj.outputs.has_wrapper }}" = "true" ]; then
+            chmod +x ./gradlew
             ./gradlew --version
             ./gradlew assembleDebug
           else
@@ -110,22 +117,22 @@ jobs:
             gradle assembleDebug
           fi
 
+      # Artefakt hochladen
       - name: APK hochladen
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: trex-debug-apk
           path: |
-            ${{ steps.findproj.outputs.project_dir }}/**/*.apk
-            ${{ steps.findproj.outputs.project_dir }}/**/outputs/**/*.apk
+            ${{ steps.findproj.outputs.project_dir }}/**/build/outputs/**/*.apk
           if-no-files-found: error
-          retention-days: 7
 
+      # Bei Fehlern: Gradle-Logs hochladen (optional, hilft beim Debuggen)
       - name: Build-Logs hochladen (bei Fehlern)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs
-          path: ${{ steps.findproj.outputs.project_dir }}/**/build/**/*.log
-          if-no-files-found: warn
-          retention-days: 7
+          name: gradle-logs
+          path: |
+            ${{ steps.findproj.outputs.project_dir }}/**/build/**/reports
+            ${{ steps.findproj.outputs.project_dir }}/**/build/**/outputs/**/*.txt
+          if-no-files-found: ignore
