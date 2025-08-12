@@ -63,21 +63,29 @@ jobs:
           mkdir -p "$DEST"
           unzip -q "${{ steps.findzip.outputs.zip }}" -d "$DEST"
 
-      - name: Projektordner finden
+      - name: Projektordner + Gradle-Datei finden
         id: findproj
         run: |
+          set -e
           ROOT="$RUNNER_TEMP/appsrc"
-          if GRADLEW="$(find "$ROOT" -type f -name "gradlew" | head -n1)"; then
+
+          # Gradle Wrapper suchen (korrekte Prüfung!)
+          GRADLEW="$(find "$ROOT" -type f -name "gradlew" | head -n1 || true)"
+          if [ -n "$GRADLEW" ]; then
             echo "has_wrapper=true" >> "$GITHUB_OUTPUT"
             echo "project_dir=$(dirname "$GRADLEW")" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if SETTINGS="$(find "$ROOT" -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" \) | head -n1)"; then
+
+          # Fallback: settings.gradle(.kts) -> Projektwurzel
+          SETTINGS="$(find "$ROOT" -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" \) | head -n1 || true)"
+          if [ -n "$SETTINGS" ]; then
             echo "has_wrapper=false" >> "$GITHUB_OUTPUT"
             echo "project_dir=$(dirname "$SETTINGS")" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "::error::Kein Android-Projekt gefunden!"
+
+          echo "::error::Kein Android-Projekt (gradlew/settings.gradle) gefunden!"
           exit 1
 
       - name: SDK Pfad in local.properties setzen
@@ -96,11 +104,14 @@ jobs:
       - name: Debug-APK bauen
         working-directory: ${{ steps.findproj.outputs.project_dir }}
         run: |
+          set -e
           if [ "${{ steps.findproj.outputs.has_wrapper }}" = "true" ]; then
+            echo "Wrapper gefunden – benutze ./gradlew"
             chmod +x ./gradlew
             ./gradlew --version
             ./gradlew assembleDebug
           else
+            echo "Kein Wrapper – benutze gradle"
             gradle --version
             gradle assembleDebug
           fi
