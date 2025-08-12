@@ -2,6 +2,10 @@ name: T-Rex APK erstellen (ZIP)
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - 'TrexRoarApp_*.zip'
+      - '.github/workflows/**'
 
 env:
   ZIP_NAME: TrexRoarApp_v2.zip
@@ -32,6 +36,7 @@ jobs:
         run: |
           if [ ! -f "$ZIP_NAME" ]; then
             echo "::error ::$ZIP_NAME fehlt im Repository-Root"
+            echo "Lade die ZIP ins Repo hoch oder ändere ZIP_NAME oben."
             exit 1
           fi
           unzip -q "$ZIP_NAME" -d extracted
@@ -42,7 +47,7 @@ jobs:
             echo "PROJECT_DIR=extracted/$FIRST" >> $GITHUB_ENV
           fi
 
-      - name: Projekt fixen
+      - name: Projekt vorbereiten (AndroidX/SDK/Theme)
         run: |
           cd "$PROJECT_DIR"
           echo "android.useAndroidX=true" >> gradle.properties
@@ -56,8 +61,8 @@ jobs:
           sed -i 's/minSdkVersion *[0-9][0-9]*/minSdkVersion 24/g' "$GR" || true
 
           if ! grep -q "com.google.android.material" "$GR"; then
-            echo '    implementation "com.google.android.material:material:1.12.0"' >> "$GR"
-            echo '    implementation "androidx.core:core-splashscreen:1.0.1"' >> "$GR"
+            printf '\n    implementation "com.google.android.material:material:1.12.0"\n' >> "$GR"
+            printf '    implementation "androidx.core:core-splashscreen:1.0.1"\n' >> "$GR"
           fi
 
           mkdir -p app/src/main/res/values app/src/main/res/values-night
@@ -75,7 +80,7 @@ XML
           cd "$PROJECT_DIR"
           ./gradlew :app:assembleDebug --no-daemon
 
-      - name: APK hochladen
+      - name: APK als Artefakt hochladen
         uses: actions/upload-artifact@v4
         with:
           name: trex-debug-apk
