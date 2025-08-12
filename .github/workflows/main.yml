@@ -24,6 +24,7 @@ jobs:
       - name: Android SDK vorbereiten & Lizenzen akzeptieren
         shell: bash
         run: |
+          set -e
           yes | sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --licenses || true
           sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager \
             "platform-tools" "platforms;android-34" "build-tools;34.0.0"
@@ -32,9 +33,10 @@ jobs:
         id: findzip
         shell: bash
         run: |
+          set -e
           ZIP="$(ls TrexRoarApp_*.zip 2>/dev/null | head -n1 || true)"
           if [ -z "$ZIP" ]; then
-            echo "Keine passende ZIP gefunden!"
+            echo "Keine passende ZIP gefunden (TrexRoarApp_*.zip)!"
             exit 1
           fi
           echo "ZIP_NAME=$ZIP" >> $GITHUB_ENV
@@ -43,53 +45,161 @@ jobs:
       - name: ZIP entpacken
         shell: bash
         run: |
+          set -e
           rm -rf extracted
           mkdir extracted
           unzip -o "$ZIP_NAME" -d extracted
 
-      - name: Projektordner finden
+      - name: Projektordner + Gradle-Datei finden
         id: findproject
         shell: bash
         run: |
+          set -e
           GRADLEW=$(find extracted -name gradlew | head -n1 || true)
+          SETTINGS=$(find extracted -name settings.gradle -o -name settings.gradle.kts | head -n1 || true)
           if [ -n "$GRADLEW" ]; then
             echo "PROJECT_DIR=$(dirname "$GRADLEW")" >> $GITHUB_ENV
             echo "BUILD_TOOL=wrapper" >> $GITHUB_ENV
+          elif [ -n "$SETTINGS" ]; then
+            echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> $GITHUB_ENV
+            echo "BUILD_TOOL=gradle_cli" >> $GITHUB_ENV
           else
-            SETTINGS=$(find extracted -name settings.gradle -o -name settings.gradle.kts | head -n1 || true)
-            if [ -n "$SETTINGS" ]; then
-              echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> $GITHUB_ENV
-              echo "BUILD_TOOL=gradle_cli" >> $GITHUB_ENV
-            else
-              echo "Kein Projekt erkannt!"
-              exit 1
+            echo "Kein Gradle-Projekt erkannt!"
+            find extracted -maxdepth 3 -type f | sed 's/^/  /'
+            exit 1
+          fi
+
+          # app-Gradle-Datei ermitteln
+          APP_GRADLE=$(find "$PROJECT_DIR" -maxdepth 3 \( -name build.gradle -o -name build.gradle.kts \) -path "*/app/*" | head -n1 || true)
+          if [ -z "$APP_GRADLE" ]; then
+            # Fallback: erstbeste build.gradle* im Projekt
+            APP_GRADLE=$(find "$PROJECT_DIR" -maxdepth 3 \( -name build.gradle -o -name build.gradle.kts \) | head -n1 || true)
+          fi
+          if [ -z "$APP_GRADLE" ]; then
+            echo "Keine build.gradle(.kts) gefunden!"
+            exit 1
+          fi
+          echo "APP_GRADLE=$APP_GRADLE" >> $GITHUB_ENV
+          echo "Gefundene App-Gradle: $APP_GRADLE"
+
+          # Manifest für namespace
+          MANIFEST=$(find "$PROJECT_DIR" -maxdepth 5 -path "*/src/main/AndroidManifest.xml" | head -n1 || true)
+          if [ -n "$MANIFEST" ]; then
+            PKG=$(grep -oP 'package="[^"]+' "$MANIFEST" | sed 's/package="//' | head -n1)
+            if [ -n "$PKG" ]; then
+              echo "PKG_NAMESPACE=$PKG" >> $GITHUB_ENV
+              echo "Manifest-Package: $PKG"
             fi
           fi
 
-      - name: Falls nötig Gradle installieren
+      - name: Gradle-Konfig automatisch fixen (SDK/AndroidX/Namespace/Deps)
+        shell: bash
+        run: |
+          set -e
+          FILE="$APP_GRADLE"
+          echo "Patche $FILE"
+
+          # AndroidX Flags via gradle.properties anlegen/setzen
+          GP="$PROJECT_DIR/gradle.properties"
+          touch "$GP"
+          grep -q '^android.useAndroidX=' "$GP" || echo 'android.useAndroidX=true' >> "$GP"
+          grep -q '^android.enableJetifier=' "$GP" || echo 'android.enableJetifier=true' >> "$GP"
+
+          # compileSdk/targetSdk setzen (für Groovy und KTS Varianten)
+          if grep -q 'compileSdk' "$FILE"; then
+            sed -i 's/compileSdk[Version]* *[=]* *[0-9][0-9]*/compileSdk = 34/g' "$FILE" || true
+            sed -i 's/compileSdkVersion *[0-9][0-9]*/compileSdkVersion 34/g' "$FILE" || true
+          else
+            # in android{} Block einfügen
+            awk '
+              BEGIN{ins=0}
+              /android *\{/ {print; print "    compileSdk = 34"; ins=1; next}
+              {print}
+              END{if(ins==0){print "android {"; print "    compileSdk = 34"; print "}" }}
+            ' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+          fi
+
+          if grep -q 'targetSdk' "$FILE"; then
+            sed -i 's/targetSdk *[=]* *[0-9][0-9]*/targetSdk = 34/g' "$FILE" || true
+            sed -i 's/targetSdkVersion *[0-9][0-9]*/targetSdkVersion 34/g' "$FILE" || true
+          else
+            # in defaultConfig{} Block einfügen
+            awk '
+              BEGIN{ins=0}
+              /defaultConfig *\{/ {print; print "        targetSdk = 34"; ins=1; next}
+              {print}
+              END{if(ins==0){print "defaultConfig {"; print "    targetSdk = 34"; print "}" }}
+            ' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+          fi
+
+          # namespace setzen, falls fehlt
+          if [ -n "$PKG_NAMESPACE" ]; then
+            if ! grep -q '^[ \t]*namespace[ \t]*' "$FILE"; then
+              awk -v NS="$PKG_NAMESPACE" '
+                /android *\{/ && ins==0 {print; print "    namespace = \"" NS "\""; ins=1; next}
+                {print}
+              ' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+            fi
+          fi
+
+          # Dependencies sicherstellen (Material, Core KTX, AppCompat, SplashScreen)
+          ensure_dep() {
+            local notoken="$1"
+            local addline="$2"
+            if ! grep -q "$notoken" "$FILE"; then
+              if grep -q 'dependencies *\{' "$FILE"; then
+                awk -v L="$addline" '
+                  /dependencies *\{/ {print; print "    " L; next}
+                  {print}
+                ' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+              else
+                printf "\n\ndependencies {\n    %s\n}\n" "$addline" >> "$FILE"
+              fi
+            fi
+          }
+
+          ensure_dep 'androidx.core:core-ktx' 'implementation "androidx.core:core-ktx:1.13.1"'
+          ensure_dep 'androidx.appcompat:appcompat' 'implementation "androidx.appcompat:appcompat:1.7.0"'
+          ensure_dep 'com.google.android.material:material' 'implementation "com.google.android.material:material:1.12.0"'
+          ensure_dep 'androidx.core:core-splashscreen' 'implementation "androidx.core:core-splashscreen:1.0.1"'
+
+          echo "Patch abgeschlossen."
+
+      - name: Falls nötig Gradle CLI installieren
         if: env.BUILD_TOOL == 'gradle_cli'
         shell: bash
         run: |
+          set -e
           curl -s "https://get.sdkman.io" | bash
           source "$HOME/.sdkman/bin/sdkman-init.sh"
           sdk install gradle 8.7
+          gradle -v
 
       - name: Debug-APK bauen
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
+          set -e
           if [ "${BUILD_TOOL}" = "wrapper" ]; then
             chmod +x gradlew
-            ./gradlew assembleDebug
+            ./gradlew --stacktrace --no-daemon assembleDebug
           else
-            gradle assembleDebug
+            gradle --stacktrace --no-daemon assembleDebug
           fi
 
       - name: APK hochladen
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: trex-debug-apk
           path: |
-            ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
             ${{ env.PROJECT_DIR }}/**/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
+      - name: Build-Logs hochladen (bei Fehlern)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trex-build-logs
+          path: ${{ env.PROJECT_DIR }}/**/build/**/reports/**
+          if-no-files-found: warn
