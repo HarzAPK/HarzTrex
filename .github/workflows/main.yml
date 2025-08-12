@@ -1,7 +1,7 @@
 name: T-Rex APK erstellen (ZIP)
 
 on:
-  workflow_dispatch:  # sorgt für den "Run workflow"-Knopf
+  workflow_dispatch:  # manueller Start
 
 jobs:
   build:
@@ -17,7 +17,6 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # Android SDK (cmdline-tools) + Lizenzen + benötigte Pakete
       - name: Android SDK vorbereiten & Lizenzen akzeptieren
         shell: bash
         run: |
@@ -26,33 +25,64 @@ jobs:
           sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager \
             "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
-      # ZIP-Datei entpacken (Name anpassen, falls du sie anders genannt hast)
       - name: ZIP entpacken
         run: unzip -o TrexRoarApp_v2.zip
 
-      # Projektordner automatisch finden (Ordner mit gradlew)
-      - name: Projektordner finden
+      - name: Projektordner automatisch finden (gradlew oder settings.gradle)
         id: findproj
         shell: bash
         run: |
           set -e
-          PROJECT_DIR=$(dirname "$(git ls-files -z | tr '\0' '\n' | grep -m1 '/gradlew$')" || true)
-          if [ -z "$PROJECT_DIR" ]; then
-            PROJECT_DIR=$(dirname "$(find . -maxdepth 3 -type f -name gradlew | head -n1)" || true)
+          # 1) Gradle-Wrapper suchen
+          GRADLEW_PATH="$(find . -type f -name gradlew | head -n1 || true)"
+          if [ -n "$GRADLEW_PATH" ]; then
+            PROJECT_DIR="$(dirname "$GRADLEW_PATH")"
+            echo "BUILD_TOOL=wrapper" >> $GITHUB_ENV
+            echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+            echo "Gefunden: gradlew in $PROJECT_DIR"
+            exit 0
           fi
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "Kein gradlew gefunden. Bitte prüfe die ZIP-Struktur." >&2
+
+          # 2) Fallback: Projekt anhand settings.gradle / build.gradle finden
+          SETTINGS_DIR="$(find . -type f \( -name settings.gradle -o -name settings.gradle.kts \) -printf '%h\n' | head -n1 || true)"
+          if [ -z "$SETTINGS_DIR" ]; then
+            SETTINGS_DIR="$(find . -type f \( -name build.gradle -o -name build.gradle.kts \) -printf '%h\n' | head -n1 || true)"
+          fi
+
+          if [ -z "$SETTINGS_DIR" ]; then
+            echo "Kein gradlew und kein settings.gradle/build.gradle gefunden. ZIP-Inhalt (Top-Ebene):"
+            ls -la
+            echo "Bitte prüfe die ZIP-Struktur." >&2
             exit 1
           fi
-          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
-          echo "Gefundener Projektordner: $PROJECT_DIR"
 
-      - name: Debug-APK bauen
-        working-directory: ${{ env.PROJECT_DIR }}
+          echo "BUILD_TOOL=gradle_cli" >> $GITHUB_ENV
+          echo "PROJECT_DIR=$SETTINGS_DIR" >> $GITHUB_ENV
+          echo "Gefunden: Gradle-Projekt in $SETTINGS_DIR (ohne gradlew)"
+
+      - name: Falls nötig: Gradle 8.7 installieren (SDKMAN)
+        if: env.BUILD_TOOL == 'gradle_cli'
+        shell: bash
         run: |
-          chmod +x gradlew
-          ./gradlew --version
-          ./gradlew assembleDebug
+          set -e
+          curl -s "https://get.sdkman.io" | bash
+          source "$HOME/.sdkman/bin/sdkman-init.sh"
+          sdk install gradle 8.7
+          gradle -v
+
+      - name: Debug-APK bauen (Wrapper oder Gradle CLI)
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -e
+          if [ "${BUILD_TOOL}" = "wrapper" ]; then
+            chmod +x gradlew
+            ./gradlew --version
+            ./gradlew assembleDebug
+          else
+            gradle --version
+            gradle assembleDebug
+          fi
 
       - name: APK hochladen
         uses: actions/upload-artifact@v4
