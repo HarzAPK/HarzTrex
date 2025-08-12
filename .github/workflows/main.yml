@@ -2,157 +2,122 @@ name: T-Rex APK erstellen (ZIP)
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - "TrexRoarApp_v2.zip"
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Repository auschecken
         uses: actions/checkout@v4
 
-      - name: Tools installieren
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y unzip curl
+      - name: JDK 17 installieren
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
 
-      - name: Android SDK Basis einrichten
+      - name: Android SDK vorbereiten & Lizenzen akzeptieren
         uses: android-actions/setup-android@v3
-
-      - name: SDK-Manager vorbereiten & Lizenzen akzeptieren
+      - name: Notwendige Android-Pakete installieren
         run: |
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
-            "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+          sdkmanager --licenses <<< "y"
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
-      - name: Gradle 8.7 installieren
-        run: |
-          curl -s "https://get.sdkman.io" | bash
-          source "$HOME/.sdkman/bin/sdkman-init.sh"
-          sdk install gradle 8.7
-          gradle --version
-
-      - name: Projekt aus ZIP entpacken
+      - name: ZIP prüfen & entpacken
         run: |
           set -e
-          test -f TrexRoarApp_v2.zip || (echo "ZIP nicht gefunden!" && exit 1)
+          ZIP="TrexRoarApp_v2.zip"
+          [ -f "$ZIP" ] || { echo "ZIP '$ZIP' nicht gefunden!"; exit 1; }
           rm -rf extracted
-          unzip -o TrexRoarApp_v2.zip -d extracted
-          ROOT=$(find extracted -maxdepth 2 -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" \) -printf "%h\n" | head -n1)
-          [ -z "$ROOT" ] && { echo "Kein Gradle-Projekt gefunden."; exit 1; }
-          echo "PROJECT_DIR=$ROOT" >> "$GITHUB_ENV"
-          echo "Benutztes Projektverzeichnis: $ROOT"
+          mkdir -p extracted
+          unzip -q "$ZIP" -d extracted
+          echo "== Inhalt von extracted =="
+          find extracted -maxdepth 3 -type f | sed 's/^/  /'
 
-      - name: AndroidX + Gradle-Properties setzen
-        run: |
-          PROPS="$PROJECT_DIR/gradle.properties"
-          touch "$PROPS"
-          grep -q '^android.useAndroidX=' "$PROPS" || echo "android.useAndroidX=true" >> "$PROPS"
-          grep -q '^android.enableJetifier=' "$PROPS" || echo "android.enableJetifier=true" >> "$PROPS"
-
-      - name: Launcher-Icon reparieren (Fallback)
-        shell: bash
+      - name: Projektverzeichnis erkennen
+        id: probe
         run: |
           set -e
-          APP="$PROJECT_DIR/app"
-          RES="$APP/src/main/res"
-          mkdir -p "$RES"
-
-          # 1) Ein passendes PNG im drawable suchen (unsere T-Rex-Grafik)
-          ICON_SRC=""
-          for n in trex_icon trex_logo trex_skull_logo app_icon; do
-            [ -f "$RES/drawable/$n.png" ] && ICON_SRC="$RES/drawable/$n.png" && ICON_NAME="$n" && break
-          done
-          if [ -z "$ICON_SRC" ]; then
-            CAND=$(find "$RES/drawable" -maxdepth 1 -type f -name "*.png" | head -n1 || true)
-            if [ -n "$CAND" ]; then ICON_SRC="$CAND"; ICON_NAME="$(basename "$CAND" .png)"; fi
+          # Kandidaten: Verzeichnis mit settings.gradle(.kts)
+          CANDIDATE=$(dirname $(git -C extracted ls-files -z | tr '\0' '\n' | grep -E 'settings\.gradle(\.kts)?$' | head -n1) 2>/dev/null || true)
+          if [ -z "$CANDIDATE" ]; then
+            # Fallback: Verzeichnis, das app/build.gradle(.kts) enthält
+            CANDIDATE=$(dirname $(git -C extracted ls-files -z | tr '\0' '\n' | grep -E 'app/(build\.gradle(\.kts)?)$' | head -n1) 2>/dev/null || true)
           fi
-          if [ -z "$ICON_SRC" ]; then
-            echo "Kein Icon-PNG gefunden – Schritt wird übersprungen."; exit 0
+          if [ -z "$CANDIDATE" ]; then
+            # Letzter Fallback: wenn nur ein Top-Level-Ordner existiert
+            TOP=$(find extracted -mindepth 1 -maxdepth 1 -type d | head -n1)
+            CANDIDATE="${TOP:-extracted}"
+          else
+            CANDIDATE="extracted/$CANDIDATE"
           fi
+          echo "PROJECT_DIR=$CANDIDATE" >> "$GITHUB_OUTPUT"
+          echo "Benutztes Projektverzeichnis: $CANDIDATE"
 
-          # 2) In alle mipmap-Ordner kopieren (als klassische Launcher-Icons)
-          for d in mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
-            mkdir -p "$RES/$d"
-            cp -f "$ICON_SRC" "$RES/$d/ic_launcher.png" || true
-            cp -f "$ICON_SRC" "$RES/$d/ic_launcher_round.png" || true
-          done
-
-          # 3) Adaptive Icon-XMLs anlegen, falls fehlen
-          mkdir -p "$RES/mipmap-anydpi-v26"
-          if [ ! -f "$RES/mipmap-anydpi-v26/ic_launcher.xml" ]; then
-            cat > "$RES/mipmap-anydpi-v26/ic_launcher.xml" <<EOF
-<?xml version="1.0" encoding="utf-8"?>
-<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-  <background android:drawable="@android:color/black"/>
-  <foreground android:drawable="@drawable/${ICON_NAME}"/>
-</adaptive-icon>
-EOF
+      - name: AndroidX/Namespace automatisch korrigieren (best effort)
+        run: |
+          set -e
+          PROJ="${{ steps.probe.outputs.PROJECT_DIR }}"
+          # Gradle Properties – AndroidX einschalten, falls Datei existiert
+          GP="$PROJ/gradle.properties"
+          if [ -f "$GP" ]; then
+            grep -q '^android.useAndroidX=' "$GP" || echo 'android.useAndroidX=true' >> "$GP"
+            grep -q '^android.enableJetifier=' "$GP" || echo 'android.enableJetifier=true' >> "$GP"
+            echo "gradle.properties angepasst."
           fi
-          if [ ! -f "$RES/mipmap-anydpi-v26/ic_launcher_round.xml" ]; then
-            cat > "$RES/mipmap-anydpi-v26/ic_launcher_round.xml" <<EOF
-<?xml version="1.0" encoding="utf-8"?>
-<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-  <background android:drawable="@android:color/black"/>
-  <foreground android:drawable="@drawable/${ICON_NAME}"/>
-</adaptive-icon>
-EOF
-          fi
-
-          # 4) Manifest sicher auf mipmap-Icons setzen
-          MAN="$APP/src/main/AndroidManifest.xml"
-          if [ -f "$MAN" ]; then
-            sed -i -E 's/android:icon="[^"]*"/android:icon="@mipmap\/ic_launcher"/' "$MAN" || true
-            if grep -q 'android:roundIcon=' "$MAN"; then
-              sed -i -E 's/android:roundIcon="[^"]*"/android:roundIcon="@mipmap\/ic_launcher_round"/' "$MAN" || true
-            else
-              sed -i -E 's/(<application[^>]*>)/\1\n        android:roundIcon="@mipmap\/ic_launcher_round"/' "$MAN" || true
+          # Wenn kein namespace gesetzt ist, aber package im Manifest, versuche namespace zu ergänzen
+          APP_BUILD_KTS="$PROJ/app/build.gradle.kts"
+          APP_BUILD_GROOVY="$PROJ/app/build.gradle"
+          MANIFEST="$PROJ/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ]; then
+            PKG=$(xmllint --xpath "string(//manifest/@package)" "$MANIFEST" 2>/dev/null || true)
+            if [ -n "$PKG" ]; then
+              if [ -f "$APP_BUILD_KTS" ] && ! grep -q '^ *namespace *=' "$APP_BUILD_KTS"; then
+                sed -i "1inamespace = \"$PKG\"" "$APP_BUILD_KTS"
+                echo "namespace in build.gradle.kts ergänzt: $PKG"
+              elif [ -f "$APP_BUILD_GROOVY" ] && ! grep -q '^ *namespace *' "$APP_BUILD_GROOVY"; then
+                sed -i "1inamespace \"$PKG\"" "$APP_BUILD_GROOVY"
+                echo "namespace in build.gradle ergänzt: $PKG"
+              fi
             fi
           fi
 
-      - name: Namespace/SDK prüfen und nur bei Bedarf patchen
-        shell: bash
+      - name: Gradle Wrapper prüfen / Fallback installieren
         run: |
           set -e
-          APP="$PROJECT_DIR/app"
-          MANIFEST="$APP/src/main/AndroidManifest.xml"
-          PKG=""
-          [ -f "$MANIFEST" ] && PKG=$(grep -oP 'package="\K[^"]+' "$MANIFEST" || true)
-          [ -z "$PKG" ] && PKG="com.example.app"
-          FILE=""
-          KTS=0
-          if [ -f "$APP/build.gradle.kts" ]; then FILE="$APP/build.gradle.kts"; KTS=1
-          elif [ -f "$APP/build.gradle" ]; then FILE="$APP/build.gradle"; else echo "Keine build.gradle gefunden – ok."; exit 0; fi
-
-          if grep -q 'namespace' "$FILE" && grep -q 'compileSdk' "$FILE" && grep -q 'targetSdk' "$FILE"; then
-            echo "Namespace/SDK bereits gesetzt."; exit 0
-          fi
-
-          if [ $KTS -eq 1 ]; then
-            sed -i.bak -E -e "s/namespace *= *\"[^\"]+\"/namespace = \"$PKG\"/g" \
-                           -e "s/compileSdk *= *[0-9]+/compileSdk = 34/g" \
-                           -e "s/targetSdk *= *[0-9]+/targetSdk = 34/g" "$FILE" || true
-            grep -q 'namespace' "$FILE" || awk -v ns="$PKG" '{print} /android[[:space:]]*\{/ && !done {print "    namespace = \"" ns "\""; done=1}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
-            grep -q 'compileSdk' "$FILE" || awk '{print} /android[[:space:]]*\{/ && !done {print "    compileSdk = 34"; done=1}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
-            grep -q 'targetSdk' "$FILE" || awk 'BEGIN{ins=0} /defaultConfig[[:space:]]*\{/ {print; print "        targetSdk = 34"; ins=1; next} {print}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+          PROJ="${{ steps.probe.outputs.PROJECT_DIR }}"
+          if [ -x "$PROJ/gradlew" ]; then
+            echo "Wrapper gefunden."
           else
-            sed -i.bak -E -e "s/namespace +\"[^\"]+\"/namespace \"$PKG\"/g" \
-                           -e "s/compileSdk +[0-9]+/compileSdk 34/g" \
-                           -e "s/targetSdk +[0-9]+/targetSdk 34/g" "$FILE" || true
-            grep -q 'namespace' "$FILE" || awk -v ns="$PKG" '{print} /android[[:space:]]*\{/ && !done {print "    namespace \"" ns "\""; done=1}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
-            grep -q 'compileSdk' "$FILE" || awk '{print} /android[[:space:]]*\{/ && !done {print "    compileSdk 34"; done=1}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
-            grep -q 'targetSdk' "$FILE" || awk 'BEGIN{ins=0} /defaultConfig[[:space:]]*\{/ {print; print "        targetSdk 34"; ins=1; next} {print}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+            echo "Kein Wrapper gefunden – installiere Gradle 8.7"
+            curl -sL https://services.gradle.org/distributions/gradle-8.7-bin.zip -o /tmp/gradle.zip
+            unzip -q /tmp/gradle.zip -d $HOME/gradle
+            echo "$HOME/gradle/gradle-8.7/bin" >> $GITHUB_PATH
           fi
-          echo "Patch-Schritt abgeschlossen."
 
       - name: Debug-APK bauen
         run: |
           set -e
-          cd "$PROJECT_DIR"
-          gradle :app:assembleDebug --no-daemon
+          PROJ="${{ steps.probe.outputs.PROJECT_DIR }}"
+          cd "$PROJ"
+          if [ -x "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew --no-daemon assembleDebug
+          else
+            gradle --no-daemon assembleDebug
+          fi
 
-      - name: APK hochladen
+      - name: APK als Artefakt hochladen
         uses: actions/upload-artifact@v4
         with:
           name: trex-debug-apk
-          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          path: |
+            ${{ steps.probe.outputs.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+            ${{ steps.probe.outputs.PROJECT_DIR }}/app/build/outputs/apk/*/debug/*.apk
