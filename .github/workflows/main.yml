@@ -12,9 +12,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      ZIP_GLOB: "*.zip"                 # falls du einen genaueren Namen willst, hier anpassen
-      ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
-      UNZIP_DIR: ${{ runner.temp }}/unz
+      ZIP_GLOB: "*.zip"   # ggf. anpassen (z.B. TrexRoarApp_*.zip)
 
     steps:
       - name: Repository auschecken
@@ -25,6 +23,12 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+
+      - name: Grundpfade setzen (aus RUNNER_TEMP)
+        run: |
+          echo "UNZIP_DIR=${RUNNER_TEMP}/unz" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=${RUNNER_TEMP}/android-sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=${RUNNER_TEMP}/android-sdk" >> "$GITHUB_ENV"
 
       - name: Tools installieren (unzip, curl, jq)
         run: |
@@ -41,7 +45,6 @@ jobs:
             echo "Kein ZIP im Repo gefunden (Muster: $ZIP_GLOB)." >&2
             exit 1
           fi
-          # jüngste ZIP nehmen, falls mehrere vorhanden sind
           newest="$(ls -1t "${files[@]}" | head -n1)"
           echo "ZIP=${newest}" | tee -a "$GITHUB_OUTPUT"
 
@@ -57,45 +60,32 @@ jobs:
         id: probe
         run: |
           set -e
-
-          # 1) Zuerst nach Verzeichnissen mit 'gradlew' suchen (bevorzugt)
           proj_dir="$(find "$UNZIP_DIR" -type f -name gradlew -printf '%h\n' | sort -u | head -n1 || true)"
-
-          # 2) Fallback: Verzeichnis mit settings.gradle(.kts) oder build.gradle(.kts)
           if [ -z "$proj_dir" ]; then
             proj_dir="$(find "$UNZIP_DIR" -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' -o -name 'build.gradle' -o -name 'build.gradle.kts' \) -printf '%h\n' | sort -u | head -n1 || true)"
           fi
-
           if [ -z "$proj_dir" ]; then
-            echo "Konnte keinen Android-Projektordner finden (weder gradlew noch settings/build.gradle)." >&2
-            echo "Bitte prüfe den Inhalt deiner ZIP."
+            echo "Konnte keinen Android-Projektordner finden." >&2
             exit 1
           fi
-
-          echo "Gefundenes Projekt: $proj_dir"
           echo "PROJECT_DIR=$proj_dir" >> "$GITHUB_ENV"
-
-          # Merken, ob ein Wrapper vorhanden ist
           if [ -f "$proj_dir/gradlew" ]; then
             echo "HAS_WRAPPER=true" >> "$GITHUB_ENV"
           else
             echo "HAS_WRAPPER=false" >> "$GITHUB_ENV"
           fi
+          echo "Gefundenes Projekt: $proj_dir"
 
       - name: Android SDK vorbereiten & Lizenzen akzeptieren
         run: |
           set -e
           mkdir -p "$ANDROID_SDK_ROOT"
           cd "$ANDROID_SDK_ROOT"
-          # cmdline-tools holen
           curl -sSL https://dl.google.com/android/repository/commandlinetools-linux-10406996_latest.zip -o cmdtools.zip
           mkdir -p cmdline-tools/latest
           unzip -q cmdtools.zip -d cmdline-tools/latest
           rm cmdtools.zip
-
-          export ANDROID_HOME="$ANDROID_SDK_ROOT"
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
-
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
           yes | sdkmanager --licenses >/dev/null
           sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
@@ -109,7 +99,6 @@ jobs:
         if: env.HAS_WRAPPER == 'false'
         run: |
           set -e
-          # Gradle 8 via SDKMAN installieren (schnell und zuverlässig)
           curl -s "https://get.sdkman.io" | bash
           source "$HOME/.sdkman/bin/sdkman-init.sh"
           sdk install gradle 8.7
